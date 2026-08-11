@@ -451,7 +451,6 @@ function wireStaticEvents() {
     if (idx < 0 || !state.layout[idx]) return;
     var f = state.layout[idx];
     f._lockRatio = !f._lockRatio;
-    // 鎖定時：widthPct = heightPct（兩者都是「自身的 %」，相等即維持原始比例）
     if (f._lockRatio) {
       f.heightPct = f.widthPct || 100;
       renderLayoutStage();
@@ -992,8 +991,8 @@ function applyFieldBoxStyleAndText(el, field) {
   el.style.left = field.xPct + '%';
   el.style.top = field.yPct + '%';
   if (field.type === 'image') {
-    var wPx = Math.round(((field.widthPct || 100) / 100) * (field.natW || state.bgNativeW || 1000) * scale);
-    var hPx = Math.round(((field.heightPct || 100) / 100) * (field.natH || state.bgNativeH || 1000) * scale);
+    var wPx = Math.round((field.widthPct || 100) / 100 * (field.natW || 80) * scale);
+    var hPx = Math.round((field.heightPct || 100) / 100 * (field.natH || 80) * scale);
     el.style.width = wPx + 'px'; el.style.height = hPx + 'px';
     el.style.display = 'flex'; el.style.flexDirection = 'column';
     el.style.alignItems = 'center'; el.style.justifyContent = 'center';
@@ -1017,26 +1016,16 @@ function applyFieldBoxStyleAndText(el, field) {
       previewImg.addEventListener('load', function () {
         var natW = previewImg.naturalWidth, natH = previewImg.naturalHeight;
         if (!natW || !natH) return;
-        // 儲存圖片原始尺寸，供渲染與單位換算使用
         field.natW = natW;
         field.natH = natH;
-        // widthPct/heightPct 意義：圖片寬高相對自身原始尺寸的百分比（100% = 原始大小）
-        var isDefault = (field.widthPct === 100 && field.heightPct === 100)
-                     || (field.widthPct === 20  && field.heightPct === 20);
-        if (isDefault) {
-          field.widthPct  = 100;
-          field.heightPct = 100;
-          field._lockRatio = true;
-        }
         var scale = layoutStageScale();
-        el.style.width  = Math.round((field.widthPct  / 100) * natW * scale) + 'px';
-        el.style.height = Math.round((field.heightPct / 100) * natH * scale) + 'px';
-        // 若此欄位正在被選取，同步更新屬性面板
+        el.style.width  = Math.round((field.widthPct  || 100) / 100 * natW * scale) + 'px';
+        el.style.height = Math.round((field.heightPct || 100) / 100 * natH * scale) + 'px';
         if (state.selectedFieldIndex === state.layout.indexOf(field)) {
           var unit = ($('#propImgUnit') && $('#propImgUnit').value) || 'pct';
           var wInput = $('#propImgWidth'), hInput = $('#propImgHeight');
-          if (wInput) wInput.value = imgPctToDisplay(field.widthPct,  'W', unit);
-          if (hInput) hInput.value = imgPctToDisplay(field.heightPct, 'H', unit);
+          if (wInput) wInput.value = imgPctToDisplay(field.widthPct || 100, 'W', unit);
+          if (hInput) hInput.value = imgPctToDisplay(field.heightPct || 100, 'H', unit);
           var lockBtn = $('#btnLockRatio');
           if (lockBtn) lockBtn.textContent = field._lockRatio ? '🔒' : '🔓';
         }
@@ -1112,7 +1101,7 @@ function isImageField(fieldName) {
 
 function defaultFieldConfig(fieldName) {
   if (isImageField(fieldName)) {
-    return { field: fieldName, type: 'image', xPct: 50, yPct: 50, widthPct: 100, heightPct: 100 };
+    return { field: fieldName, type: 'image', xPct: 50, yPct: 50, widthPct: 100, heightPct: 100, _lockRatio: true };
   }
   return {
     field: fieldName, xPct: 50, yPct: 50, fontSize: Math.round((state.bgNativeW || 1000) * 0.07),
@@ -1151,7 +1140,7 @@ function autoArrangeAllFields() {
       return existingMap[field];
     }
     if (isImageField(field)) {
-      return { field: field, type: 'image', xPct: 50, yPct: yPct, widthPct: 100, heightPct: 100 };
+      return { field: field, type: 'image', xPct: 50, yPct: yPct, widthPct: 100, heightPct: 100, _lockRatio: true };
     }
     var primary = isPrimaryFieldName(field);
     return {
@@ -1354,8 +1343,6 @@ function renderPropsPanel() {
   $('#propFieldType').value = isImage ? 'image' : 'text';
   $('#propTextControls').style.display = isImage ? 'none' : 'block';
   $('#propImageControls').style.display = isImage ? 'block' : 'none';
-  var imgUnitWrap = $('#propImgUnitWrap');
-  if (imgUnitWrap) imgUnitWrap.style.display = isImage ? 'block' : 'none';
   if (isImage) {
     var unit = ($('#propImgUnit') && $('#propImgUnit').value) || 'pct';
     var unitLabel = unit === 'px' ? 'px' : unit === 'cm' ? 'cm' : '%';
@@ -1397,25 +1384,24 @@ function onPropsChanged() {
   if (newType !== (f.type || 'text')) {
     f.type = newType;
     if (newType === 'image') {
-      f.widthPct  = f.widthPct  || 100;
-      f.heightPct = f.heightPct || 100;
+      f.widthPct   = f.widthPct   || 100;
+      f.heightPct  = f.heightPct  || 100;
+      f._lockRatio = f._lockRatio !== false;
     }
     renderPropsPanel();
   }
   if (f.type === 'image') {
     var unit = ($('#propImgUnit') && $('#propImgUnit').value) || 'pct';
-    var newW = imgDisplayToPct(parseFloat($('#propImgWidth').value) || 0, 'W', unit);
+    var newW = imgDisplayToPct(parseFloat($('#propImgWidth').value)  || 0, 'W', unit);
     var newH = imgDisplayToPct(parseFloat($('#propImgHeight').value) || 0, 'H', unit);
     if (f._lockRatio && newW && newW !== f.widthPct) {
-      // 鎖比例：寬改動 → 高跟著改（widthPct=heightPct 即維持自身原始比例）
-      f.widthPct = newW;
+      f.widthPct  = newW;
       f.heightPct = newW;
       var hInput = $('#propImgHeight');
       if (hInput) hInput.value = imgPctToDisplay(f.heightPct, 'H', unit);
     } else if (f._lockRatio && newH && newH !== f.heightPct) {
-      // 鎖比例：高改動 → 寬跟著改
       f.heightPct = newH;
-      f.widthPct = newH;
+      f.widthPct  = newH;
       var wInput = $('#propImgWidth');
       if (wInput) wInput.value = imgPctToDisplay(f.widthPct, 'W', unit);
     } else {
@@ -1611,6 +1597,7 @@ function loadNameListTab(uid) {
         f.type = 'image';
         if (!f.widthPct)  f.widthPct  = 100;
         if (!f.heightPct) f.heightPct = 100;
+        if (f._lockRatio === undefined) f._lockRatio = true;
         layoutChanged = true;
       }
     });
@@ -1958,20 +1945,16 @@ function loadImageFromBase64(base64, mimeType) {
 }
 
 function imgPctToDisplay(pct, dim, unit) {
-  // pct 是「自身的 %」：100% = 圖片原始尺寸
+  var f = state.layout && state.layout[state.selectedFieldIndex];
+  var natPx = dim === 'W' ? (f && f.natW) : (f && f.natH);
   if (unit === 'px') {
-    var f = state.layout && state.layout[state.selectedFieldIndex];
-    var natPx = dim === 'W' ? (f && f.natW || state.bgNativeW || 1000)
-                            : (f && f.natH || state.bgNativeH || 1000);
+    if (!natPx) return Math.round(pct * 10) / 10;
     return Math.round(pct / 100 * natPx);
   }
   if (unit === 'cm') {
-    var f = state.layout && state.layout[state.selectedFieldIndex];
-    var natPx  = dim === 'W' ? (f && f.natW || state.bgNativeW || 1000)
-                             : (f && f.natH || state.bgNativeH || 1000);
-    var bgPx   = dim === 'W' ? (state.bgNativeW || 1000) : (state.bgNativeH || 1000);
-    var badgeMm = dim === 'W' ? parseFloat($('#pdfBadgeW').value)
-                              : parseFloat($('#pdfBadgeH').value);
+    if (!natPx) return Math.round(pct * 10) / 10;
+    var bgPx    = dim === 'W' ? (state.bgNativeW || 1000) : (state.bgNativeH || 1000);
+    var badgeMm = dim === 'W' ? parseFloat($('#pdfBadgeW').value) : parseFloat($('#pdfBadgeH').value);
     if (!badgeMm) return Math.round(pct * 10) / 10;
     return Math.round(pct / 100 * natPx / bgPx * badgeMm / 10 * 100) / 100;
   }
@@ -1979,19 +1962,16 @@ function imgPctToDisplay(pct, dim, unit) {
 }
 
 function imgDisplayToPct(val, dim, unit) {
+  var f = state.layout && state.layout[state.selectedFieldIndex];
+  var natPx = dim === 'W' ? (f && f.natW) : (f && f.natH);
   if (unit === 'px') {
-    var f = state.layout && state.layout[state.selectedFieldIndex];
-    var natPx = dim === 'W' ? (f && f.natW || state.bgNativeW || 1000)
-                            : (f && f.natH || state.bgNativeH || 1000);
+    if (!natPx) return val;
     return val / natPx * 100;
   }
   if (unit === 'cm') {
-    var f = state.layout && state.layout[state.selectedFieldIndex];
-    var natPx  = dim === 'W' ? (f && f.natW || state.bgNativeW || 1000)
-                             : (f && f.natH || state.bgNativeH || 1000);
-    var bgPx   = dim === 'W' ? (state.bgNativeW || 1000) : (state.bgNativeH || 1000);
-    var badgeMm = dim === 'W' ? parseFloat($('#pdfBadgeW').value)
-                              : parseFloat($('#pdfBadgeH').value);
+    if (!natPx) return val;
+    var bgPx    = dim === 'W' ? (state.bgNativeW || 1000) : (state.bgNativeH || 1000);
+    var badgeMm = dim === 'W' ? parseFloat($('#pdfBadgeW').value) : parseFloat($('#pdfBadgeH').value);
     if (!badgeMm) return val;
     return val * 10 / badgeMm * bgPx / natPx * 100;
   }
@@ -2044,8 +2024,8 @@ function renderBadgeCanvas(bgImg, nativeW, nativeH, layout, rowData, outputScale
     if (field.type === 'image') {
       var img = rowImages && rowImages[field.field];
       if (!img) return;
-      var iw = ((field.widthPct || 100) / 100) * (field.natW || img.naturalWidth || nativeW);
-      var ih = ((field.heightPct || 100) / 100) * (field.natH || img.naturalHeight || nativeH);
+      var iw = (field.widthPct  || 100) / 100 * (field.natW || img.naturalWidth  || nativeW);
+      var ih = (field.heightPct || 100) / 100 * (field.natH || img.naturalHeight || nativeH);
       ctx.drawImage(img, (field.xPct / 100) * nativeW - iw / 2, (field.yPct / 100) * nativeH - ih / 2, iw, ih);
       return;
     }
