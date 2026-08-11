@@ -1,0 +1,2060 @@
+<script>
+/* global google, JSZip */
+'use strict';
+
+// ============================================================
+// 全域狀態
+// ============================================================
+var SESSION_KEY_SHEET_IDS = 'nametag_spreadsheet_ids'; // 這個瀏覽器分頁目前連結的試算表 ID 陣列
+var LOCAL_KEY_RECENT_SHEETS = 'nametag_recent_spreadsheets'; // 最近連結過的試算表，換瀏覽器分頁/重開瀏覽器都還看得到
+
+var state = {
+  connected: false,
+  connectedSheets: [],    // [{id, name, url}] 這個瀏覽器分頁目前連結的所有試算表，可以不只一份
+  categories: [],         // 所有已連結試算表彙總起來的類別，每筆多帶 spreadsheetId/spreadsheetName 標明來源
+  adoptableSheets: [],    // 同上彙總，每筆多帶 spreadsheetId/spreadsheetName
+  currentCategory: null,  // 「spreadsheetId::key」組成的識別碼，不能只用 key（不同試算表可能剛好同名）
+  headers: [],            // 目前類別的欄位標題 (含系統欄位)
+  rows: [],                // 目前類別的名單列
+  layout: [],              // 目前類別的版面設定 [{field,xPct,yPct,fontSize,fontFamily,color,bold,align,maxWidthPct}]
+  bgImageEl: null,         // 目前已載入的背景 <img>
+  bgNativeW: 0,
+  bgNativeH: 0,
+  selectedFieldIndex: -1,
+  dirtyLayout: false,
+  layoutHistory: [],      // 版面編輯的復原/取消復原歷史紀錄（state.layout 的快照陣列）
+  layoutHistoryIndex: -1,
+  editingRowIndex: null,   // 名單管理表單目前是「新增」還是在編輯某一列
+  checkedRows: new Set(),  // 名單管理裡勾選的列（_rowIndex），供「只處理勾選的」與 PDF 匯出範圍使用
+  lastGenerated: [],       // [{filename, dataUrl, rowIndex}] 本次瀏覽器工作階段中已產生的名牌，供打包下載
+  exportScope: 'all',      // 'all' | 'pending' | 'checked' — 輸出範圍（PNG 與 PDF 共用）
+  cancelGeneration: false  // PNG 渲染迴圈的取消旗標
+};
+
+var FONT_CHOICES = [
+  { label: '思源黑體 Noto Sans TC', value: "'Noto Sans TC','Microsoft JhengHei','PingFang TC',sans-serif" },
+  { label: '思源宋體 Noto Serif TC', value: "'Noto Serif TC','PMingLiU',serif" },
+  { label: '微軟正黑體', value: "'Microsoft JhengHei',sans-serif" },
+  { label: 'Arial', value: "Arial,Helvetica,sans-serif" },
+  { label: 'Times New Roman', value: "'Times New Roman',Times,serif" },
+  { label: 'Georgia', value: "Georgia,serif" }
+];
+
+var measureCanvas = document.createElement('canvas');
+var measureCtx = measureCanvas.getContext('2d');
+
+// ============================================================
+// google.script.run 包裝成 Promise
+// ============================================================
+function runAsync(fnName) {
+  var args = Array.prototype.slice.call(arguments, 1);
+  return new Promise(function (resolve, reject) {
+    if (!window.google || !google.script || !google.script.run) {
+      reject(new Error('google.script.run 無法使用（不在 Apps Script 執行環境中）'));
+      return;
+    }
+    google.script.run
+      .withSuccessHandler(resolve)
+      .withFailureHandler(function (err) { reject(new Error(err && err.message ? err.message : String(err))); })[fnName]
+      .apply(null, args);
+  });
+}
+
+// ============================================================
+// 小工具
+// ============================================================
+function $(sel, root) { return (root || document).querySelector(sel); }
+function $all(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+function toast(msg, isError) {
+  var el = $('#toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (isError ? ' error' : '');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(function () { el.className = 'toast'; }, 3200);
+}
+function sanitizeFilename(s) {
+  return String(s || '').replace(/[\\/:*?"<>|]/g, '_').trim() || 'unnamed';
+}
+function busy(el, isBusy) { if (el) el.disabled = !!isBusy; }
+
+// ============================================================
+// 啟動流程
+// ============================================================
+window.addEventListener('DOMContentLoaded', function () {
+  wireStaticEvents();
+  boot();
+});
+
+function boot() {
+  ensureFontsLoaded(); // 提早開始下載字型，不阻塞畫面
+  if (!getConnectedIds_().length) {
+    applyAggregatedInfo_([]);
+    return;
+  }
+  refreshAllConnections();
+}
+
+function categoryUid(spreadsheetId, key) { return spreadsheetId + '::' + key; }
+
+// ---- 這個瀏覽器分頁目前連結的試算表清單（sessionStorage，分頁各自獨立） ----
+function getConnectedIds_() {
+  try { return JSON.parse(sessionStorage.getItem(SESSION_KEY_SHEET_IDS) || '[]'); } catch (e) { return []; }
+}
+function setConnectedIds_(ids) { sessionStorage.setItem(SESSION_KEY_SHEET_IDS, JSON.stringify(ids)); }
+function addConnectedId_(id) {
+  var ids = getConnectedIds_();
+  if (ids.indexOf(id) === -1) { ids.push(id); setConnectedIds_(ids); }
+}
+function removeConnectedId_(id) { setConnectedIds_(getConnectedIds_().filter(function (x) { return x !== id; })); }
+
+// ---- 最近連結過的試算表（localStorage，跨分頁、關掉分頁或重開瀏覽器都還在，純粹是方便快速接回） ----
+function getRecentSheets_() {
+  try { return JSON.parse(localStorage.getItem(LOCAL_KEY_RECENT_SHEETS) || '[]'); } catch (e) { return []; }
+}
+function pushRecentSheet_(info) {
+  var list = getRecentSheets_().filter(function (s) { return s.id !== info.id; });
+  list.unshift({ id: info.id, name: info.name, url: info.url });
+  if (list.length > 10) list = list.slice(0, 10);
+  localStorage.setItem(LOCAL_KEY_RECENT_SHEETS, JSON.stringify(list));
+}
+function removeRecentSheet_(id) {
+  localStorage.setItem(LOCAL_KEY_RECENT_SHEETS, JSON.stringify(getRecentSheets_().filter(function (s) { return s.id !== id; })));
+}
+
+// document.fonts.ready 只會等待「已經觸發過」的字型下載，若字型從未被用過就不會被它等到，
+// 所以改成明確呼叫 document.fonts.load() 逐一預先載入版面編輯器會用到的所有字型，
+// 並在畫布量測/輸出前 await 這個 Promise，確保 canvas.measureText() 用的是正確字型的字寬。
+var FONT_LOAD_PROMISE = null;
+function ensureFontsLoaded() {
+  if (FONT_LOAD_PROMISE) return FONT_LOAD_PROMISE;
+  if (!document.fonts || !document.fonts.load) { FONT_LOAD_PROMISE = Promise.resolve(); return FONT_LOAD_PROMISE; }
+  var jobs = [];
+  FONT_CHOICES.forEach(function (fc) {
+    jobs.push(document.fonts.load('400 16px ' + fc.value).catch(function () {}));
+    jobs.push(document.fonts.load('700 16px ' + fc.value).catch(function () {}));
+  });
+  FONT_LOAD_PROMISE = Promise.all(jobs);
+  return FONT_LOAD_PROMISE;
+}
+
+// 重新跟伺服器確認「這個分頁記住的每一個試算表 ID」現在還連得到、資料是什麼，
+// 全部要完之後統一彙總成 state.categories／state.adoptableSheets（各自標明來自哪份試算表）。
+function refreshAllConnections() {
+  var ids = getConnectedIds_();
+  if (!ids.length) { applyAggregatedInfo_([]); return Promise.resolve(); }
+  return Promise.all(ids.map(function (id) { return runAsync('getSpreadsheetInfo', id); }))
+    .then(function (results) {
+      var validSheets = [];
+      var stillValidIds = [];
+      results.forEach(function (info, i) {
+        if (info.connected) { validSheets.push(info); stillValidIds.push(ids[i]); }
+        // 連不到的（例如被刪除、收回權限）就悄悄從清單移除，不用每次開頁都跳錯誤
+      });
+      if (stillValidIds.length !== ids.length) setConnectedIds_(stillValidIds);
+      applyAggregatedInfo_(validSheets);
+    }).catch(function (err) { toast(err.message, true); });
+}
+
+function applyAggregatedInfo_(sheetsInfoArray) {
+  state.connectedSheets = sheetsInfoArray.map(function (s) { return { id: s.id, name: s.name, url: s.url }; });
+  state.connected = state.connectedSheets.length > 0;
+
+  var allCats = [], allAdopt = [], seenKeys = {};
+  sheetsInfoArray.forEach(function (s) {
+    (s.categories || []).forEach(function (c) {
+      if (seenKeys[c.key] && seenKeys[c.key] !== s.id) {
+        toast('⚠️「' + c.key + '」這個類別代碼在多份已連結的試算表裡重複，只會顯示先連結的那個，建議幫其中一個改代碼', true);
+        return;
+      }
+      seenKeys[c.key] = s.id;
+      allCats.push(Object.assign({}, c, { spreadsheetId: s.id, spreadsheetName: s.name }));
+    });
+    (s.adoptableSheets || []).forEach(function (a) {
+      allAdopt.push(Object.assign({}, a, { spreadsheetId: s.id, spreadsheetName: s.name }));
+    });
+  });
+  state.categories = allCats;
+  state.adoptableSheets = allAdopt;
+
+  var dot = $('#connDot');
+  var label = $('#connLabel');
+  if (state.connected) {
+    dot.className = 'dot on';
+    label.textContent = state.connectedSheets.length === 1
+      ? ('已連結：' + state.connectedSheets[0].name)
+      : ('已連結 ' + state.connectedSheets.length + ' 份試算表');
+  } else {
+    dot.className = 'dot off';
+    label.textContent = '尚未連結試算表';
+  }
+
+  $all('nav.tabs button[data-tab]').forEach(function (btn) {
+    if (btn.dataset.tab !== 'settings') btn.disabled = !state.connected;
+  });
+
+  renderConnectedSheetsList();
+  renderRecentSheets();
+  renderTargetSheetSelector();
+  renderCategoryGrid();
+  renderAdoptableSheets();
+
+  var stillValidCurrent = state.currentCategory && currentCategoryObj();
+  if (!stillValidCurrent) {
+    if (state.categories.length) {
+      selectCategory(categoryUid(state.categories[0].spreadsheetId, state.categories[0].key));
+    } else {
+      state.currentCategory = null;
+      renderLayoutEmpty();
+      renderListEmpty();
+      renderGenerateEmpty();
+    }
+  }
+}
+
+function renderConnectedSheetsList() {
+  var wrap = $('#connectedSheetsList');
+  if (!state.connectedSheets.length) {
+    wrap.innerHTML = '<div class="hint">尚未連結任何試算表，請在下方連結或建立一個。</div>';
+    return;
+  }
+  wrap.innerHTML = state.connectedSheets.map(function (s) {
+    var catsHere = state.categories.filter(function (c) { return c.spreadsheetId === s.id; });
+    var catText = catsHere.length ? catsHere.map(function (c) { return c.displayName; }).join('、') : '（還沒有類別）';
+    return '<div class="cat-card" style="cursor:default" data-sheet-card="' + escapeHtml(s.id) + '">' +
+      '<div class="name"><a href="' + s.url + '" target="_blank">' + escapeHtml(s.name) + '</a></div>' +
+      '<div class="meta">類別：' + escapeHtml(catText) + '</div>' +
+      '<div class="row" style="margin-top:8px"><button class="small danger" data-disconnect-sheet="' + escapeHtml(s.id) + '">取消連結</button></div>' +
+      '</div>';
+  }).join('');
+  $all('button[data-disconnect-sheet]', wrap).forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var s = state.connectedSheets.filter(function (x) { return x.id === btn.dataset.disconnectSheet; })[0];
+      if (!confirm('確定要取消連結「' + (s ? s.name : '') + '」嗎？（試算表本身不會被刪除，只是這個分頁暫時不再指向它）')) return;
+      removeConnectedId_(btn.dataset.disconnectSheet);
+      refreshAllConnections();
+      toast('已取消連結');
+    });
+  });
+}
+
+function renderRecentSheets() {
+  var section = $('#recentSheetsWrap');
+  var wrap = $('#recentSheetsList');
+  var recents = getRecentSheets_().filter(function (s) {
+    return state.connectedSheets.every(function (cs) { return cs.id !== s.id; });
+  }).slice(0, 5);
+  if (!recents.length) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  wrap.innerHTML = recents.map(function (s) {
+    return '<button class="small" data-reconnect="' + escapeHtml(s.id) + '" data-url="' + escapeHtml(s.url) + '">🔁 ' + escapeHtml(s.name) + '</button>';
+  }).join(' ');
+  $all('button[data-reconnect]', wrap).forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      busy(btn, true);
+      runAsync('connectSpreadsheet', btn.dataset.url).then(function (info) {
+        if (!info.connected) throw new Error(info.error || '連結失敗');
+        addConnectedId_(info.id);
+        pushRecentSheet_(info);
+        toast('已重新連結「' + info.name + '」');
+        return refreshAllConnections();
+      }).catch(function (err) {
+        toast('這份試算表現在連不到了，已從清單移除：' + err.message, true);
+        removeRecentSheet_(btn.dataset.reconnect);
+        renderRecentSheets();
+      }).finally(function () { busy(btn, false); });
+    });
+  });
+}
+
+function renderTargetSheetSelector() {
+  var row = $('#targetSheetRow');
+  var sel = $('#newCatTargetSheet');
+  if (state.connectedSheets.length <= 1) { row.style.display = 'none'; return; }
+  row.style.display = 'flex';
+  var prevValue = sel.value;
+  sel.innerHTML = state.connectedSheets.map(function (s) { return '<option value="' + escapeHtml(s.id) + '">' + escapeHtml(s.name) + '</option>'; }).join('');
+  var stillThere = state.connectedSheets.some(function (s) { return s.id === prevValue; });
+  sel.value = stillThere ? prevValue : state.connectedSheets[state.connectedSheets.length - 1].id; // 預設選最後加入的那份
+}
+
+function getTargetSpreadsheetId_() {
+  if (!state.connectedSheets.length) return null;
+  if (state.connectedSheets.length === 1) return state.connectedSheets[0].id;
+  var sel = $('#newCatTargetSheet');
+  return sel && sel.value ? sel.value : state.connectedSheets[0].id;
+}
+
+// ============================================================
+// 頁籤切換
+// ============================================================
+function wireStaticEvents() {
+  $all('nav.tabs button[data-tab]').forEach(function (btn) {
+    btn.addEventListener('click', function () { switchTab(btn.dataset.tab); });
+  });
+
+  // ---- 活動設定 ----
+  $('#btnConnect').addEventListener('click', function () {
+    var url = $('#sheetUrlInput').value.trim();
+    if (!url) { toast('請先貼上試算表連結', true); return; }
+    busy($('#btnConnect'), true);
+    runAsync('connectSpreadsheet', url).then(function (info) {
+      if (!info.connected) throw new Error(info.error || '連結失敗');
+      addConnectedId_(info.id);
+      pushRecentSheet_(info);
+      $('#sheetUrlInput').value = '';
+      toast('已連結「' + info.name + '」');
+      return refreshAllConnections();
+    }).catch(function (err) { toast(err.message, true); }).finally(function () { busy($('#btnConnect'), false); });
+  });
+
+  $('#btnCreateNew').addEventListener('click', function () {
+    var name = prompt('請輸入新活動試算表的名稱：', '名牌活動_' + new Date().toISOString().slice(0, 10));
+    if (name === null) return;
+    runAsync('createNewEventSpreadsheet', name).then(function (info) {
+      addConnectedId_(info.id);
+      pushRecentSheet_(info);
+      toast('已建立新的活動試算表');
+      return refreshAllConnections();
+    }).catch(function (err) { toast(err.message, true); });
+  });
+
+  $('#btnAddCategory').addEventListener('click', function () {
+    var targetId = getTargetSpreadsheetId_();
+    if (!targetId) { toast('請先連結一份試算表', true); return; }
+    var key = $('#newCatKey').value.trim();
+    var displayName = $('#newCatDisplay').value.trim();
+    var headersCsv = $('#newCatHeaders').value.trim();
+    if (!key) { toast('請輸入類別代碼（會作為分頁名稱）', true); return; }
+    var headers = headersCsv ? headersCsv.split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean) : [];
+    runAsync('createCategory', targetId, key, displayName, headers).then(function () {
+      $('#newCatKey').value = ''; $('#newCatDisplay').value = ''; $('#newCatHeaders').value = '';
+      return refreshAllConnections();
+    }).then(function () {
+      selectCategory(categoryUid(targetId, key));
+      toast('已新增類別「' + key + '」');
+    }).catch(function (err) { toast(err.message, true); });
+  });
+
+  $('#btnSetupDefaults').addEventListener('click', function () {
+    var targetId = getTargetSpreadsheetId_();
+    if (!targetId) { toast('請先連結一份試算表', true); return; }
+    busy($('#btnSetupDefaults'), true);
+    runAsync('setupDefaultCategories', targetId).then(function (result) {
+      return refreshAllConnections().then(function () {
+        toast(result.created.length ? ('已建立：' + result.created.join('、')) : '三個範本類別都已經存在了');
+      });
+    }).catch(function (err) { toast(err.message, true); }).finally(function () { busy($('#btnSetupDefaults'), false); });
+  });
+
+  // ---- 版面編輯器 ----
+  $('#layoutCategorySelect').addEventListener('change', function (e) { selectCategory(e.target.value); });
+  $('#btnUploadBg').addEventListener('click', function () { $('#bgFileInput').click(); });
+  $('#btnDownloadBlankBg').addEventListener('click', downloadBlankBackground);
+  $('#bgFileInput').addEventListener('change', handleBgFileChosen);
+  $('#btnAutoArrange').addEventListener('click', function () {
+    var added = autoArrangeMissingFields();
+    if (!added) { toast('目前的欄位都已經放置過了'); return; }
+    renderLayoutStage();
+    renderFieldTray();
+    toast('已自動排好 ' + added + ' 個欄位的起始位置');
+  });
+  $('#btnSaveLayout').addEventListener('click', saveLayoutToServer);
+  $('#btnUndoLayout').addEventListener('click', undoLayout);
+  $('#btnRedoLayout').addEventListener('click', redoLayout);
+  $('#btnCenterH').addEventListener('click', centerSelectedFieldH);
+  $('#btnCenterV').addEventListener('click', centerSelectedFieldV);
+  $('#btnRemoveField').addEventListener('click', removeSelectedField);
+  ['propFontSize', 'propColor', 'propFontFamily', 'propBold', 'propAlign', 'propMaxWidth', 'propX', 'propY']
+    .forEach(function (id) {
+      var el = $('#' + id);
+      el.addEventListener('input', onPropsChanged); // 即時預覽
+      el.addEventListener('change', pushLayoutHistory); // 值確定變更後才記一筆復原紀錄，避免每個按鍵都記
+    });
+
+  // ---- 名單管理 ----
+  $('#listCategorySelect').addEventListener('change', function (e) { selectCategory(e.target.value); });
+  $('#btnAddEntry').addEventListener('click', submitSingleEntry);
+  $('#btnCancelEdit').addEventListener('click', resetAddEntryFormMode);
+  $('#btnParseBulk').addEventListener('click', parseBulkPaste);
+  $('#btnConfirmBulk').addEventListener('click', confirmBulkImport);
+  $('#btnUploadExcel').addEventListener('click', function () { $('#excelFileInput').click(); });
+  $('#excelFileInput').addEventListener('change', handleExcelFileChosen);
+
+  // ---- 產生名牌 ----
+  $('#genCategorySelect').addEventListener('change', function (e) { selectCategory(e.target.value); });
+  $('#btnGenerateAndDownload').addEventListener('click', generateBadges);
+  $('#btnCancelGen').addEventListener('click', function () {
+    state.cancelGeneration = true;
+    this.disabled = true;
+    this.textContent = '取消中…';
+  });
+  $('#btnClearAllStatus').addEventListener('click', clearAllGenerationStatus);
+  $('#btnOpenFolder').addEventListener('click', openDriveFolder);
+  $('#btnLockBadgeRatio').addEventListener('click', toggleBadgeRatioLock);
+  $('#btnRestoreBadgeRatio').addEventListener('click', restoreBadgeRatio);
+  $('#pdfBadgeW').addEventListener('input', function () {
+    if (badgeRatioLocked && badgeLockedAspect) {
+      var w = parseFloat(this.value);
+      if (w > 0) $('#pdfBadgeH').value = Math.round(w / badgeLockedAspect * 10) / 10;
+    }
+    updateRestoreBtnState();
+    markPdfPreviewStale();
+  });
+  $('#pdfBadgeH').addEventListener('input', function () {
+    if (badgeRatioLocked && badgeLockedAspect) {
+      var h = parseFloat(this.value);
+      if (h > 0) $('#pdfBadgeW').value = Math.round(h * badgeLockedAspect * 10) / 10;
+    }
+    updateRestoreBtnState();
+    markPdfPreviewStale();
+  });
+  $all('.scope-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (btn.dataset.scope === 'checked' && state.checkedRows.size === 0) return;
+      state.exportScope = btn.dataset.scope;
+      $all('.scope-btn').forEach(function (b) { b.classList.toggle('primary', b.dataset.scope === state.exportScope); });
+    });
+  });
+  $('#pdfPageSize').addEventListener('change', onPdfPageSizeChanged);
+  $('#btnExportPdf').addEventListener('click', exportPdf);
+  $('#btnDownloadBlankPdf').addEventListener('click', downloadBlankBadgePdf);
+  $('#btnPreviewPdf').addEventListener('click', previewPdfLayout);
+
+  // 當 PDF 設定有任何變動，標記預覽已過期
+  ['pdfPageSize', 'pdfOrientation', 'pdfCustomW', 'pdfCustomH',
+   'pdfBadgeW', 'pdfBadgeH', 'pdfGap', 'pdfMargin', 'pdfBlankCount'].forEach(function (id) {
+    var el = $('#' + id);
+    if (el) el.addEventListener('change', markPdfPreviewStale);
+  });
+
+  // ---- 匯出頁籤切換（圖片 / PDF） ----
+  $all('.export-tab-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      $all('.export-tab-btn').forEach(function (b) { b.classList.remove('primary'); });
+      btn.classList.add('primary');
+      var tab = btn.dataset.exportTab;
+      $('#exportImagePanel').style.display = tab === 'image' ? 'block' : 'none';
+      $('#exportPdfPanel').style.display = tab === 'pdf' ? 'block' : 'none';
+    });
+  });
+}
+
+function switchTab(tab) {
+  $all('nav.tabs button[data-tab]').forEach(function (b) { b.classList.toggle('active', b.dataset.tab === tab); });
+  $all('.tabpanel').forEach(function (p) { p.classList.toggle('active', p.id === 'tab-' + tab); });
+  if (!state.currentCategory) return;
+  // 名單/狀態可能在其他頁籤被改動過（例如剛產生完名牌），切換頁籤時重新讀取以避免顯示過期資料。
+  // 版面編輯頁籤刻意不自動重新讀取，避免蓋掉使用者尚未儲存的拖曳調整。
+  if (tab === 'layout') requestAnimationFrame(layoutStageResize);
+  else if (tab === 'list') loadNameListTab(state.currentCategory);
+  else if (tab === 'generate') loadGenerateTab(state.currentCategory);
+}
+
+// ============================================================
+// 類別選擇（三個分頁共用同一個「目前類別」）
+// ============================================================
+function renderCategoryGrid() {
+  var grid = $('#catGrid');
+  var multiSheet = state.connectedSheets.length > 1;
+  if (!state.categories.length) {
+    grid.innerHTML = '<div class="hint">目前已連結的試算表還沒有任何名牌類別，請在下方新增一個（例如：學員 / 工作人員 / 講師貴賓）。</div>';
+  } else {
+    grid.innerHTML = state.categories.map(function (c) {
+      var uid = categoryUid(c.spreadsheetId, c.key);
+      var sel = uid === state.currentCategory ? ' selected' : '';
+      var bg = c.bgFileId ? '已設定背景' : '尚未上傳背景';
+      var sheetTag = multiSheet ? ('<div class="meta">📄 ' + escapeHtml(c.spreadsheetName) + '</div>') : '';
+      return '<div class="cat-card' + sel + '" data-uid="' + escapeHtml(uid) + '">' +
+        '<div class="name">' + escapeHtml(c.displayName) + '</div>' +
+        '<div class="meta">分頁：' + escapeHtml(c.key) + ' ・ ' + bg + '</div>' + sheetTag +
+        '<div class="row" style="margin-top:8px">' +
+        '<button class="small" data-rename-uid="' + escapeHtml(uid) + '">✏️ 重新命名</button>' +
+        '<button class="small danger" data-remove-uid="' + escapeHtml(uid) + '">🗑️ 移除</button>' +
+        '</div></div>';
+    }).join('');
+    $all('.cat-card', grid).forEach(function (card) {
+      card.addEventListener('click', function () { selectCategory(card.dataset.uid); });
+    });
+    $all('button[data-rename-uid]', grid).forEach(function (btn) {
+      btn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        var uid = btn.dataset.renameUid;
+        var cat = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === uid; })[0];
+        if (!cat) return;
+        var name = prompt('輸入「' + cat.key + '」的新顯示名稱：', cat.displayName);
+        if (name === null || !name.trim()) return;
+        runAsync('renameCategoryDisplayName', cat.spreadsheetId, cat.key, name.trim()).then(function () {
+          return refreshAllConnections();
+        }).then(function () { toast('已更新顯示名稱'); }).catch(function (err) { toast(err.message, true); });
+      });
+    });
+    $all('button[data-remove-uid]', grid).forEach(function (btn) {
+      btn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        var uid = btn.dataset.removeUid;
+        var cat = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === uid; })[0];
+        if (!cat) return;
+        if (!confirm('確定要移除類別「' + cat.key + '」嗎？\n（只會移除設定，底下的「' + cat.key + '」名單分頁不會被刪除，資料還在，之後要用「採用既有分頁」隨時可以接回來）')) return;
+        runAsync('removeCategoryFromConfig', cat.spreadsheetId, cat.key).then(function () {
+          if (state.currentCategory === uid) state.currentCategory = null;
+          return refreshAllConnections();
+        }).then(function () { toast('已移除類別「' + cat.key + '」'); }).catch(function (err) { toast(err.message, true); });
+      });
+    });
+  }
+  // 同步三個下拉選單
+  [['#layoutCategorySelect'], ['#listCategorySelect'], ['#genCategorySelect']].forEach(function (arr) {
+    var sel = $(arr[0]);
+    sel.innerHTML = state.categories.map(function (c) {
+      var uid = categoryUid(c.spreadsheetId, c.key);
+      var label = c.displayName + (multiSheet ? ('（' + c.spreadsheetName + '）') : '');
+      return '<option value="' + escapeHtml(uid) + '">' + escapeHtml(label) + '</option>';
+    }).join('');
+    if (state.currentCategory) sel.value = state.currentCategory;
+  });
+}
+
+function renderAdoptableSheets() {
+  var wrap = $('#adoptWrap');
+  if (!state.connected || !state.adoptableSheets.length) {
+    wrap.style.display = 'none';
+    return;
+  }
+  var multiSheet = state.connectedSheets.length > 1;
+  wrap.style.display = 'block';
+  $('#adoptList').innerHTML = state.adoptableSheets.map(function (s, idx) {
+    var headerText = s.headers.length ? s.headers.join('、') : '（沒有偵測到欄位標題）';
+    var fromTag = multiSheet ? ('・來自「' + escapeHtml(s.spreadsheetName) + '」') : '';
+    return '<div class="cat-card" style="cursor:default;margin-bottom:8px">' +
+      '<div class="name">' + escapeHtml(s.sheetName) + '</div>' +
+      '<div class="meta">欄位：' + escapeHtml(headerText) + ' ・ ' + s.rowCount + ' 筆資料' + fromTag + '</div>' +
+      '<div class="row" style="margin-top:8px">' +
+      '<input type="text" data-display-idx="' + idx + '" placeholder="顯示名稱（可留空）" style="min-width:220px">' +
+      '<button class="small primary" data-adopt-idx="' + idx + '">採用為類別</button>' +
+      '</div></div>';
+  }).join('');
+  $all('button[data-adopt-idx]', $('#adoptList')).forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var idx = parseInt(btn.dataset.adoptIdx, 10);
+      var sheetInfo = state.adoptableSheets[idx];
+      var displayInput = $('input[data-display-idx="' + idx + '"]');
+      busy(btn, true);
+      runAsync('adoptSheetAsCategory', sheetInfo.spreadsheetId, sheetInfo.sheetName, displayInput.value.trim())
+        .then(function () { return refreshAllConnections(); })
+        .then(function () {
+          selectCategory(categoryUid(sheetInfo.spreadsheetId, sheetInfo.sheetName));
+          toast('已採用「' + sheetInfo.sheetName + '」為類別');
+        })
+        .catch(function (err) { toast(err.message, true); busy(btn, false); });
+    });
+  });
+}
+
+function selectCategory(uid) {
+  if (state.dirtyLayout && state.currentCategory && state.currentCategory !== uid) {
+    if (!confirm('目前的版面設定尚未儲存，切換類別將會遺失變更，確定要切換嗎？')) {
+      // 還原下拉選單顯示
+      $all('select').forEach(function (s) { if (s.id.indexOf('CategorySelect') !== -1) s.value = state.currentCategory; });
+      return;
+    }
+  }
+  state.currentCategory = uid;
+  state.dirtyLayout = false;
+  renderCategoryGrid();
+  loadCategoryData(uid);
+}
+
+function currentCategoryObj() {
+  return state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === state.currentCategory; })[0] || null;
+}
+
+function loadCategoryData(uid) {
+  if (!uid) return;
+  loadLayoutEditor(uid);
+  loadNameListTab(uid);
+  loadGenerateTab(uid);
+}
+
+// ============================================================
+// 版面編輯器
+// ============================================================
+function renderLayoutEmpty() {
+  $('#layoutBody').style.display = 'none';
+  $('#layoutEmpty').style.display = 'block';
+}
+
+function loadLayoutEditor(uid) {
+  var catRef = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === uid; })[0];
+  if (!catRef) return Promise.resolve();
+  $('#layoutEmpty').style.display = 'none';
+  $('#layoutBody').style.display = 'block';
+  $('#layoutCategorySelect').value = uid;
+  state.selectedFieldIndex = -1;
+
+  return Promise.all([runAsync('getBackgroundImageData', catRef.spreadsheetId, catRef.key), ensureFontsLoaded()]).then(function (results) {
+    var data = results[0];
+    var cat = currentCategoryObj();
+    state.layout = (data && data.layout) || (cat ? cat.layout : []) || [];
+    state.dirtyLayout = false;
+    state.layoutHistory = [cloneLayout(state.layout)];
+    state.layoutHistoryIndex = 0;
+    updateUndoRedoButtons();
+    updateSaveButtonState();
+    if (data) {
+      state.bgNativeW = data.width;
+      state.bgNativeH = data.height;
+      var img = new Image();
+      img.onload = function () {
+        state.bgImageEl = img;
+        $('#bgInfo').textContent = data.width + ' x ' + data.height + ' px';
+        renderLayoutStage();
+      };
+      img.src = 'data:' + data.mimeType + ';base64,' + data.base64;
+    } else {
+      state.bgImageEl = null;
+      state.bgNativeW = 0; state.bgNativeH = 0;
+      $('#bgInfo').textContent = '尚未上傳背景圖片';
+      renderLayoutStage();
+    }
+    renderFieldTray();
+    renderPropsPanel();
+  }).catch(function (err) { toast(err.message, true); });
+}
+
+function handleBgFileChosen(e) {
+  var file = e.target.files[0];
+  if (!file) return;
+  var cat = currentCategoryObj();
+  if (!cat) { toast('請先選擇一個類別', true); return; }
+  var uid = state.currentCategory;
+  var img = new Image();
+  var reader = new FileReader();
+  reader.onload = function () {
+    var dataUrl = reader.result;
+    img.onload = function () {
+      var w = img.naturalWidth, h = img.naturalHeight;
+      var base64 = dataUrl.split(',')[1];
+      toast('上傳中，請稍候…');
+      runAsync('uploadBackground', cat.spreadsheetId, cat.key, base64, file.type || 'image/png', file.name, w, h)
+        .then(function () {
+          toast('背景圖片已更新');
+          return refreshAllConnections();
+        }).then(function () {
+          return loadLayoutEditor(uid);
+        }).then(function () {
+          // 第一次上傳背景、畫布上還完全沒有欄位時，直接幫忙排好一組通用起始位置，
+          // 使用者只要微調就好，不用每個欄位都從拖曳開始。
+          if (!state.layout.length) {
+            var added = autoArrangeMissingFields();
+            if (added > 0) {
+              renderLayoutStage();
+              renderFieldTray();
+              toast('已自動排好 ' + added + ' 個欄位的起始位置，檢查後記得按「儲存版面設定」');
+            }
+          }
+        }).catch(function (err) { toast(err.message, true); });
+    };
+    img.src = dataUrl;
+  };
+  reader.readAsDataURL(file);
+  e.target.value = '';
+}
+
+function downloadBlankBackground() {
+  if (!state.bgImageEl || !state.bgImageEl.src) { toast('尚未上傳背景圖片', true); return; }
+  var src = state.bgImageEl.src;
+  var mimeMatch = src.match(/^data:([^;]+);/);
+  var mime = mimeMatch ? mimeMatch[1] : 'image/png';
+  var ext = mime.indexOf('jpeg') !== -1 ? 'jpg' : (mime.indexOf('png') !== -1 ? 'png' : 'img');
+  var cat = currentCategoryObj();
+  var a = document.createElement('a');
+  a.href = src;
+  a.download = sanitizeFilename(cat ? cat.key : 'badge') + '_空白背景.' + ext;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+var STAGE_MAX_W = 560;
+var STAGE_MAX_H = 640;
+
+function layoutStageScale() {
+  if (!state.bgNativeW || !state.bgNativeH) return 1;
+  return Math.min(STAGE_MAX_W / state.bgNativeW, STAGE_MAX_H / state.bgNativeH, 1);
+}
+
+function layoutStageResize() {
+  var stage = $('#editorStage');
+  if (!state.bgNativeW) { stage.style.width = '360px'; stage.style.height = '440px'; return; }
+  var scale = layoutStageScale();
+  stage.style.width = Math.round(state.bgNativeW * scale) + 'px';
+  stage.style.height = Math.round(state.bgNativeH * scale) + 'px';
+}
+
+function renderLayoutStage() {
+  var stage = $('#editorStage');
+  layoutStageResize();
+  var bgImg = $('#editorBgImg');
+  if (state.bgImageEl) {
+    bgImg.src = state.bgImageEl.src;
+    bgImg.style.display = 'block';
+  } else {
+    bgImg.removeAttribute('src');
+    bgImg.style.display = 'none';
+  }
+  $all('.field-box', stage).forEach(function (n) { n.remove(); });
+  state.layout.forEach(function (field, idx) { stage.appendChild(buildFieldBoxEl(field, idx)); });
+}
+
+function sampleValueFor(fieldName) {
+  if (state.rows && state.rows.length) {
+    var v = state.rows[0][fieldName];
+    if (v !== undefined && v !== null && v !== '') return String(v);
+  }
+  return '[' + fieldName + ']';
+}
+
+function buildFieldBoxEl(field, idx) {
+  var el = document.createElement('div');
+  el.className = 'field-box' + (idx === state.selectedFieldIndex ? ' selected' : '');
+  el.dataset.idx = idx;
+  applyFieldBoxStyleAndText(el, field);
+  el.addEventListener('pointerdown', function (ev) { startDragExistingField(ev, idx); });
+  return el;
+}
+
+function applyFieldBoxStyleAndText(el, field) {
+  var scale = layoutStageScale();
+  var text = sampleValueFor(field.field);
+  var fit = fitText(text, field, state.bgNativeW || 1000);
+  el.style.left = field.xPct + '%';
+  el.style.top = field.yPct + '%';
+  el.style.color = field.color || '#000000';
+  el.style.fontFamily = field.fontFamily || FONT_CHOICES[0].value;
+  el.style.fontWeight = field.bold ? '700' : '400';
+  el.style.textAlign = field.align || 'center';
+  el.style.fontSize = Math.max(6, fit.fontSize * scale) + 'px';
+  el.innerHTML = fit.lines.map(escapeHtml).join('<br>');
+  var anchorShift = field.align === 'left' ? '0%' : (field.align === 'right' ? '-100%' : '-50%');
+  el.style.transform = 'translate(' + anchorShift + ', -50%)';
+}
+
+// ---- 從欄位工具列拖曳新增 ----
+function renderFieldTray() {
+  var tray = $('#fieldTray');
+  var placedFields = state.layout.map(function (f) { return f.field; });
+  var available = (state.headers || []).filter(function (h) {
+    return h !== '產生狀態' && h !== '產生時間' && h !== '圖片連結';
+  });
+  if (!available.length) {
+    tray.innerHTML = '<div class="hint">此類別的分頁還沒有欄位標題。</div>';
+  } else {
+    tray.innerHTML = available.map(function (h) {
+      var already = placedFields.indexOf(h) !== -1;
+      return '<div class="chip" draggable="false" data-field="' + escapeHtml(h) + '" style="' +
+        (already ? 'opacity:.45' : '') + '">' + escapeHtml(h) + (already ? '（已放置）' : '') + '</div>';
+    }).join('');
+    $all('.chip', tray).forEach(function (chip) {
+      chip.addEventListener('pointerdown', function (ev) { startDragNewField(ev, chip.dataset.field); });
+    });
+  }
+  renderPlacedList();
+}
+
+function renderPlacedList() {
+  var list = $('#placedList');
+  if (!state.layout.length) {
+    list.innerHTML = '<div class="hint">尚未放置任何欄位，從上方拖曳到畫布上。</div>';
+    return;
+  }
+  list.innerHTML = state.layout.map(function (f, idx) {
+    return '<div class="placed-item" data-idx="' + idx + '"><span>' + escapeHtml(f.field) + '</span>' +
+      '<button class="small" data-sel="' + idx + '">編輯</button></div>';
+  }).join('');
+  $all('button[data-sel]', list).forEach(function (btn) {
+    btn.addEventListener('click', function () { selectField(parseInt(btn.dataset.sel, 10)); });
+  });
+}
+
+function defaultFieldConfig(fieldName) {
+  return {
+    field: fieldName, xPct: 50, yPct: 50, fontSize: Math.round((state.bgNativeW || 1000) * 0.07),
+    fontFamily: FONT_CHOICES[0].value, color: '#000000', bold: false, align: 'center', maxWidthPct: 80
+  };
+}
+
+// 猜測哪個欄位是「姓名」性質的主要欄位，自動排版時給它比較大、加粗的預設樣式。
+// 只是猜測用的小提示，不影響其他邏輯，猜錯了使用者本來就可以直接調整。
+function isPrimaryFieldName(name) {
+  var s = String(name || '').trim().toLowerCase();
+  return s === '姓名' || s === 'name' || s.indexOf('姓名') !== -1 || s.indexOf('name') !== -1;
+}
+
+// 把「還沒被放進版面」的欄位，依它們在標題列裡原本的順序，由上而下平均排進畫布中段
+// （30%~75% 高度，避開背景常見的頁首/頁尾裝飾），當作一個比較通用的起始位置與大小，
+// 使用者接下來只要微調而不用每個欄位都從零開始拖。已經放置過的欄位完全不受影響。
+function autoArrangeMissingFields() {
+  var placedFields = state.layout.map(function (f) { return f.field; });
+  var allFields = (state.headers || []).filter(function (h) {
+    return h !== '產生狀態' && h !== '產生時間' && h !== '圖片連結';
+  });
+  var missing = allFields.filter(function (h) { return placedFields.indexOf(h) === -1; });
+  if (!missing.length) return 0;
+
+  var n = allFields.length;
+  var bandTop = 30, bandBottom = 75;
+  var nativeW = state.bgNativeW || 1000;
+
+  missing.forEach(function (field) {
+    var idx = allFields.indexOf(field);
+    var yPct = n > 1 ? bandTop + ((bandBottom - bandTop) * idx) / (n - 1) : 50;
+    var primary = isPrimaryFieldName(field);
+    state.layout.push({
+      field: field,
+      xPct: 50,
+      yPct: Math.round(yPct * 10) / 10,
+      fontSize: Math.round(nativeW * (primary ? 0.12 : 0.06)),
+      fontFamily: FONT_CHOICES[0].value,
+      color: '#000000',
+      bold: primary,
+      align: 'center',
+      maxWidthPct: 80
+    });
+  });
+  state.dirtyLayout = true;
+  updateSaveButtonState();
+  pushLayoutHistory();
+  return missing.length;
+}
+
+function startDragNewField(ev, fieldName) {
+  ev.preventDefault();
+  var stage = $('#editorStage');
+  var ghost = document.createElement('div');
+  ghost.className = 'field-box';
+  ghost.textContent = fieldName;
+  ghost.style.left = '50%'; ghost.style.top = '50%'; ghost.style.opacity = '0.85';
+  ghost.style.pointerEvents = 'none';
+  document.body.appendChild(ghost);
+  ghost.style.position = 'fixed';
+
+  function move(e) {
+    ghost.style.left = e.clientX + 'px';
+    ghost.style.top = e.clientY + 'px';
+    ghost.style.transform = 'translate(-50%,-50%)';
+  }
+  function up(e) {
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', up);
+    ghost.remove();
+    var rect = stage.getBoundingClientRect();
+    if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+      var xPct = ((e.clientX - rect.left) / rect.width) * 100;
+      var yPct = ((e.clientY - rect.top) / rect.height) * 100;
+      var cfg = defaultFieldConfig(fieldName);
+      cfg.xPct = Math.round(xPct * 10) / 10;
+      cfg.yPct = Math.round(yPct * 10) / 10;
+      state.layout.push(cfg);
+      state.dirtyLayout = true;
+      updateSaveButtonState();
+      renderLayoutStage();
+      renderFieldTray();
+      selectField(state.layout.length - 1);
+      pushLayoutHistory();
+    }
+  }
+  document.addEventListener('pointermove', move);
+  document.addEventListener('pointerup', up);
+  move(ev);
+}
+
+function startDragExistingField(ev, idx) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  var stage = $('#editorStage');
+  var startX = ev.clientX, startY = ev.clientY;
+  var moved = false;
+  selectField(idx);
+
+  function move(e) {
+    var dx = e.clientX - startX, dy = e.clientY - startY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
+    if (!moved) return;
+    var rect = stage.getBoundingClientRect();
+    var xPct = Math.min(100, Math.max(0, ((e.clientX - rect.left) / rect.width) * 100));
+    var yPct = Math.min(100, Math.max(0, ((e.clientY - rect.top) / rect.height) * 100));
+    state.layout[idx].xPct = Math.round(xPct * 10) / 10;
+    state.layout[idx].yPct = Math.round(yPct * 10) / 10;
+    state.dirtyLayout = true;
+    updateSaveButtonState();
+    var el = $('.field-box[data-idx="' + idx + '"]', stage);
+    if (el) applyFieldBoxStyleAndText(el, state.layout[idx]);
+    updatePropsPanelPositionOnly();
+  }
+  function up() {
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', up);
+    if (moved) pushLayoutHistory(); // 只有真的拖動過才記錄一筆歷史，單純點選不算
+  }
+  document.addEventListener('pointermove', move);
+  document.addEventListener('pointerup', up);
+}
+
+function selectField(idx) {
+  state.selectedFieldIndex = idx;
+  renderLayoutStage();
+  renderPropsPanel();
+}
+
+function renderPropsPanel() {
+  var form = $('#propsForm');
+  var empty = $('#propsEmpty');
+  var idx = state.selectedFieldIndex;
+  if (idx < 0 || !state.layout[idx]) {
+    form.style.display = 'none';
+    empty.style.display = 'block';
+    return;
+  }
+  form.style.display = 'block';
+  empty.style.display = 'none';
+  var f = state.layout[idx];
+  $('#propFieldName').textContent = f.field;
+  $('#propFontSize').value = f.fontSize;
+  $('#propColor').value = f.color || '#000000';
+  var famSel = $('#propFontFamily');
+  if (!famSel.dataset.filled) {
+    famSel.innerHTML = FONT_CHOICES.map(function (fc) { return '<option value="' + fc.value + '">' + fc.label + '</option>'; }).join('');
+    famSel.dataset.filled = '1';
+  }
+  famSel.value = f.fontFamily || FONT_CHOICES[0].value;
+  $('#propBold').checked = !!f.bold;
+  $('#propAlign').value = f.align || 'center';
+  $('#propMaxWidth').value = f.maxWidthPct;
+  $('#propX').value = f.xPct;
+  $('#propY').value = f.yPct;
+}
+
+function updatePropsPanelPositionOnly() {
+  var idx = state.selectedFieldIndex;
+  if (idx < 0 || !state.layout[idx]) return;
+  $('#propX').value = state.layout[idx].xPct;
+  $('#propY').value = state.layout[idx].yPct;
+}
+
+function onPropsChanged() {
+  var idx = state.selectedFieldIndex;
+  if (idx < 0 || !state.layout[idx]) return;
+  var f = state.layout[idx];
+  f.fontSize = parseFloat($('#propFontSize').value) || f.fontSize;
+  f.color = $('#propColor').value;
+  f.fontFamily = $('#propFontFamily').value;
+  f.bold = $('#propBold').checked;
+  f.align = $('#propAlign').value;
+  f.maxWidthPct = parseFloat($('#propMaxWidth').value) || f.maxWidthPct;
+  f.xPct = parseFloat($('#propX').value);
+  f.yPct = parseFloat($('#propY').value);
+  state.dirtyLayout = true;
+  updateSaveButtonState();
+  renderLayoutStage();
+  var el = $('.field-box[data-idx="' + idx + '"]');
+  if (el) el.classList.add('selected');
+}
+
+function removeSelectedField() {
+  var idx = state.selectedFieldIndex;
+  if (idx < 0) return;
+  state.layout.splice(idx, 1);
+  state.selectedFieldIndex = -1;
+  state.dirtyLayout = true;
+  updateSaveButtonState();
+  renderLayoutStage();
+  renderFieldTray();
+  renderPropsPanel();
+  pushLayoutHistory();
+}
+
+function saveLayoutToServer() {
+  var catRef = currentCategoryObj();
+  if (!catRef) return;
+  busy($('#btnSaveLayout'), true);
+  runAsync('saveLayout', catRef.spreadsheetId, catRef.key, state.layout).then(function () {
+    state.dirtyLayout = false;
+    // 存檔成功後同步更新 state.categories 裡快取的版面資訊，
+    // 不然「產生名牌」頁籤讀到的還是存檔前的舊快取，會誤判成「尚未設定版面」。
+    var cat = currentCategoryObj();
+    if (cat) cat.layout = cloneLayout(state.layout);
+    toast('版面設定已儲存');
+  }).catch(function (err) { toast(err.message, true); }).finally(function () { updateSaveButtonState(); });
+}
+
+// ---- 復原 / 取消復原 ----
+function cloneLayout(layout) { return JSON.parse(JSON.stringify(layout || [])); }
+
+function pushLayoutHistory() {
+  // 如果曾經按過「上一步」、現在又做了新動作，後面那段「未來」的分支要砍掉，符合一般復原/重做的直覺
+  state.layoutHistory = state.layoutHistory.slice(0, state.layoutHistoryIndex + 1);
+  state.layoutHistory.push(cloneLayout(state.layout));
+  state.layoutHistoryIndex = state.layoutHistory.length - 1;
+  updateUndoRedoButtons();
+}
+
+function restoreLayoutFromHistory() {
+  state.layout = cloneLayout(state.layoutHistory[state.layoutHistoryIndex]);
+  state.selectedFieldIndex = -1;
+  state.dirtyLayout = true;
+  updateSaveButtonState();
+  renderLayoutStage();
+  renderFieldTray();
+  renderPropsPanel();
+  updateUndoRedoButtons();
+}
+
+function undoLayout() {
+  if (state.layoutHistoryIndex <= 0) return;
+  state.layoutHistoryIndex--;
+  restoreLayoutFromHistory();
+}
+
+function redoLayout() {
+  if (state.layoutHistoryIndex >= state.layoutHistory.length - 1) return;
+  state.layoutHistoryIndex++;
+  restoreLayoutFromHistory();
+}
+
+function updateUndoRedoButtons() {
+  $('#btnUndoLayout').disabled = state.layoutHistoryIndex <= 0;
+  $('#btnRedoLayout').disabled = state.layoutHistoryIndex >= state.layoutHistory.length - 1;
+}
+
+function updateSaveButtonState() {
+  $('#btnSaveLayout').disabled = !state.dirtyLayout;
+}
+
+// ---- 一鍵置中 ----
+function centerSelectedFieldH() {
+  var idx = state.selectedFieldIndex;
+  if (idx < 0 || !state.layout[idx]) return;
+  state.layout[idx].xPct = 50;
+  state.dirtyLayout = true;
+  updateSaveButtonState();
+  renderLayoutStage();
+  renderPropsPanel();
+  pushLayoutHistory();
+}
+
+function centerSelectedFieldV() {
+  var idx = state.selectedFieldIndex;
+  if (idx < 0 || !state.layout[idx]) return;
+  state.layout[idx].yPct = 50;
+  state.dirtyLayout = true;
+  updateSaveButtonState();
+  renderLayoutStage();
+  renderPropsPanel();
+  pushLayoutHistory();
+}
+
+// ============================================================
+// 文字自動縮放 / 換行 （編輯器預覽與最終輸出共用同一套邏輯）
+// ============================================================
+function fitText(text, field, nativeW) {
+  text = String(text == null ? '' : text);
+  var maxWidthPx = (field.maxWidthPct / 100) * nativeW;
+  var startSize = field.fontSize;
+  var minSize = Math.max(8, field.fontSize * 0.4);
+
+  function widthAt(sz) {
+    measureCtx.font = (field.bold ? 'bold ' : '') + sz + 'px ' + field.fontFamily;
+    return measureCtx.measureText(text).width;
+  }
+
+  if (!text) return { lines: [''], fontSize: startSize };
+
+  var size = startSize;
+  while (size > minSize && widthAt(size) > maxWidthPx) {
+    size -= Math.max(1, size * 0.03);
+  }
+  if (widthAt(size) <= maxWidthPx || size <= minSize) {
+    if (widthAt(size) <= maxWidthPx) return { lines: [text], fontSize: Math.round(size) };
+  }
+
+  // 縮到最小仍放不下 -> 改成最多三行的換行顯示
+  size = Math.max(minSize, startSize * 0.8);
+  measureCtx.font = (field.bold ? 'bold ' : '') + size + 'px ' + field.fontFamily;
+  var lines = [];
+  var cur = '';
+  for (var i = 0; i < text.length; i++) {
+    var ch = text[i];
+    var test = cur + ch;
+    if (measureCtx.measureText(test).width > maxWidthPx && cur) {
+      lines.push(cur);
+      cur = ch;
+    } else {
+      cur = test;
+    }
+  }
+  if (cur) lines.push(cur);
+  if (lines.length > 3) {
+    lines = lines.slice(0, 3);
+    lines[2] = lines[2].slice(0, Math.max(1, lines[2].length - 1)) + '…';
+  }
+  return { lines: lines, fontSize: Math.round(size) };
+}
+
+// ============================================================
+// 名單管理
+// ============================================================
+function renderListEmpty() {
+  $('#listBody').style.display = 'none';
+  $('#listEmpty').style.display = 'block';
+}
+
+function loadNameListTab(uid) {
+  var catRef = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === uid; })[0];
+  if (!catRef) return;
+  $('#listEmpty').style.display = 'none';
+  $('#listBody').style.display = 'block';
+  $('#listCategorySelect').value = uid;
+  runAsync('getNameList', catRef.spreadsheetId, catRef.key).then(function (data) {
+    state.headers = data.headers;
+    state.rows = data.rows;
+    state.checkedRows = new Set(); // 名單重新讀取後，列號可能不再對應原本勾的那些人，重置勾選
+    renderAddEntryForm();
+    resetAddEntryFormMode(); // 換分頁一律回到「新增」模式，避免把上一個類別編輯到一半的列送錯分頁
+    renderListTable();
+    updateCheckedCountUI();
+  }).catch(function (err) { toast(err.message, true); });
+}
+
+// 舊版相容（仍被外部呼叫）— 有勾選時只處理勾選，否則全部
+function filterRowsByScope(rows) {
+  if (state.checkedRows.size > 0) {
+    return rows.filter(function (r) { return state.checkedRows.has(r._rowIndex); });
+  }
+  return rows;
+}
+
+// 依 state.exportScope 篩選名單（PNG 與 PDF 匯出共用）
+function getRowsByScope(rows) {
+  if (state.exportScope === 'checked') {
+    return state.checkedRows.size > 0
+      ? rows.filter(function (r) { return state.checkedRows.has(r._rowIndex); })
+      : rows;
+  }
+  if (state.exportScope === 'pending') {
+    return rows.filter(function (r) { return !r['產生狀態']; });
+  }
+  return rows;
+}
+
+function updateCheckedCountUI() {
+  var n = state.checkedRows.size;
+  $all('.checked-count-label').forEach(function (el) {
+    el.textContent = n > 0 ? ('已勾選 ' + n + ' 筆') : '未勾選（預設處理全部名單）';
+  });
+  var scopeChecked = $('#scopeBtnChecked');
+  if (scopeChecked) scopeChecked.disabled = n === 0;
+  // 若勾選清空，且當前範圍是「勾選的」，自動回退到「全部」
+  if (n === 0 && state.exportScope === 'checked') {
+    state.exportScope = 'all';
+    $all('.scope-btn').forEach(function (b) { b.classList.toggle('primary', b.dataset.scope === 'all'); });
+  }
+}
+
+function renderListTable() {
+  var wrap = $('#listTableWrap');
+  var catRef = currentCategoryObj();
+  var displayHeaders = state.headers.filter(function (h) { return h !== '圖片連結'; });
+  var allChecked = state.rows.length > 0 && state.rows.every(function (r) { return state.checkedRows.has(r._rowIndex); });
+  var thead = '<tr><th><input type="checkbox" id="checkAllRows"' + (allChecked ? ' checked' : '') + '></th>' +
+    displayHeaders.map(function (h) { return '<th>' + escapeHtml(h) + '</th>'; }).join('') + '<th>操作</th></tr>';
+  var tbody = state.rows.map(function (r) {
+    var checked = state.checkedRows.has(r._rowIndex) ? ' checked' : '';
+    var tds = '<td><input type="checkbox" class="row-check" data-row="' + r._rowIndex + '"' + checked + '></td>' +
+      displayHeaders.map(function (h) {
+        if (h === '產生狀態') {
+          return '<td>' + (r[h] ? '<span class="pill done">已產生</span>' : '<span class="pill pending">未產生</span>') + '</td>';
+        }
+        return '<td>' + escapeHtml(r[h]) + '</td>';
+      }).join('');
+    var actions = '<td>' +
+      '<button class="small" data-act="edit" data-row="' + r._rowIndex + '">編輯</button> ' +
+      '<button class="small" data-act="del" data-row="' + r._rowIndex + '">刪除</button> ' +
+      (r['產生狀態'] ? '<button class="small" data-act="reset" data-row="' + r._rowIndex + '">重設狀態</button>' : '') +
+      '</td>';
+    return '<tr>' + tds + actions + '</tr>';
+  }).join('');
+  wrap.innerHTML = '<div class="table-scroll"><table><thead>' + thead + '</thead><tbody>' +
+    (tbody || '<tr><td colspan="' + (displayHeaders.length + 2) + '" class="hint" style="padding:16px;">目前還沒有名單，請在下方新增。</td></tr>') +
+    '</tbody></table></div>';
+
+  $('#checkAllRows').addEventListener('change', function () {
+    var checked = $('#checkAllRows').checked;
+    state.rows.forEach(function (r) {
+      if (checked) state.checkedRows.add(r._rowIndex); else state.checkedRows.delete(r._rowIndex);
+    });
+    renderListTable();
+    updateCheckedCountUI();
+  });
+  $all('.row-check', wrap).forEach(function (cb) {
+    cb.addEventListener('change', function () {
+      var idx = parseInt(cb.dataset.row, 10);
+      if (cb.checked) state.checkedRows.add(idx); else state.checkedRows.delete(idx);
+      updateCheckedCountUI();
+    });
+  });
+  $all('button[data-act="edit"]', wrap).forEach(function (btn) {
+    btn.addEventListener('click', function () { startEditRow(parseInt(btn.dataset.row, 10)); });
+  });
+  $all('button[data-act="del"]', wrap).forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (!confirm('確定要刪除這一列名單嗎？此動作無法復原。')) return;
+      runAsync('deleteNameEntry', catRef.spreadsheetId, catRef.key, parseInt(btn.dataset.row, 10)).then(function (data) {
+        state.checkedRows.delete(parseInt(btn.dataset.row, 10));
+        state.rows = data.rows; state.headers = data.headers; renderListTable();
+        updateCheckedCountUI();
+        if (state.editingRowIndex === parseInt(btn.dataset.row, 10)) resetAddEntryFormMode();
+        loadGenerateTab(state.currentCategory);
+        toast('已刪除');
+      }).catch(function (err) { toast(err.message, true); });
+    });
+  });
+  $all('button[data-act="reset"]', wrap).forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      runAsync('resetGenerationStatus', catRef.spreadsheetId, catRef.key, parseInt(btn.dataset.row, 10)).then(function (data) {
+        state.rows = data.rows; state.headers = data.headers; renderListTable(); loadGenerateTab(state.currentCategory);
+        toast('已重設為未產生，可重新輸出');
+      }).catch(function (err) { toast(err.message, true); });
+    });
+  });
+}
+
+function renderAddEntryForm() {
+  var editableHeaders = state.headers.filter(function (h) { return ['產生狀態', '產生時間', '圖片連結'].indexOf(h) === -1; });
+  var wrap = $('#addEntryFields');
+  wrap.innerHTML = editableHeaders.map(function (h) {
+    return '<div><label class="hint">' + escapeHtml(h) + '</label><input type="text" data-field="' + escapeHtml(h) + '" style="width:100%"></div>';
+  }).join('');
+}
+
+function startEditRow(rowIndex) {
+  var row = state.rows.filter(function (r) { return r._rowIndex === rowIndex; })[0];
+  if (!row) return;
+  state.editingRowIndex = rowIndex;
+  $all('#addEntryFields input').forEach(function (inp) { inp.value = row[inp.dataset.field] != null ? row[inp.dataset.field] : ''; });
+  $('#addEntryTitle').textContent = '編輯這一筆（' + (row['姓名'] || '') + '）';
+  $('#btnAddEntry').textContent = '更新';
+  $('#btnCancelEdit').style.display = 'inline-block';
+  $('#addEntryFields').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function resetAddEntryFormMode() {
+  state.editingRowIndex = null;
+  $('#addEntryTitle').textContent = '新增一筆';
+  $('#btnAddEntry').textContent = '新增';
+  $('#btnCancelEdit').style.display = 'none';
+  $all('#addEntryFields input').forEach(function (inp) { inp.value = ''; });
+}
+
+function submitSingleEntry() {
+  var catRef = currentCategoryObj();
+  if (!catRef) return;
+  var obj = {};
+  $all('#addEntryFields input').forEach(function (inp) { obj[inp.dataset.field] = inp.value; });
+  var hasValue = Object.keys(obj).some(function (k) { return obj[k]; });
+  if (!hasValue) { toast('請至少填寫一個欄位', true); return; }
+
+  var isEditing = state.editingRowIndex !== null;
+  var call = isEditing
+    ? runAsync('updateNameEntry', catRef.spreadsheetId, catRef.key, state.editingRowIndex, obj)
+    : runAsync('addNameEntry', catRef.spreadsheetId, catRef.key, obj);
+
+  call.then(function (data) {
+    state.rows = data.rows; state.headers = data.headers;
+    renderListTable();
+    resetAddEntryFormMode();
+    loadGenerateTab(state.currentCategory);
+    toast(isEditing ? '已更新這一筆名單' : '已新增一筆名單');
+  }).catch(function (err) { toast(err.message, true); });
+}
+
+// ---- 上傳本機 Excel / CSV 檔案：解析完直接塞進「批次貼上」文字框，
+// 沿用同一套預覽/確認流程，不用另外重做一次 UI。----
+function handleExcelFileChosen(e) {
+  var file = e.target.files[0];
+  if (!file) return;
+  $('#excelFileInfo').textContent = file.name;
+
+  var ext = (file.name.split('.').pop() || '').toLowerCase();
+  if (ext === 'csv') {
+    var textReader = new FileReader();
+    textReader.onload = function () {
+      $('#bulkPasteArea').value = String(textReader.result || '');
+      parseBulkPaste();
+    };
+    textReader.onerror = function () { toast('讀取檔案失敗', true); };
+    textReader.readAsText(file, 'utf-8');
+    e.target.value = '';
+    return;
+  }
+
+  if (typeof XLSX === 'undefined') {
+    toast('Excel 解析套件載入失敗，請改用「批次貼上」貼上內容，或另存成 CSV 再上傳', true);
+    e.target.value = '';
+    return;
+  }
+  var binReader = new FileReader();
+  binReader.onload = function () {
+    try {
+      // 一律直接讀取第一個工作表的第一列當標題，不特別支援多分頁選擇——
+      // 檔案裡如果有其他分頁，請先在 Excel/Google 試算表裡另存成只有一個工作表的檔案。
+      var workbook = XLSX.read(new Uint8Array(binReader.result), { type: 'array' });
+      var ws = workbook.Sheets[workbook.SheetNames[0]];
+      var tsv = XLSX.utils.sheet_to_csv(ws, { FS: '\t', blankrows: false });
+      $('#bulkPasteArea').value = tsv;
+      parseBulkPaste();
+    } catch (err) {
+      toast('無法解析這個檔案：' + err.message, true);
+    }
+  };
+  binReader.onerror = function () { toast('讀取檔案失敗', true); };
+  binReader.readAsArrayBuffer(file);
+  e.target.value = '';
+}
+
+function parseBulkPaste() {
+  var raw = $('#bulkPasteArea').value;
+  if (!raw.trim()) { toast('請先貼上資料', true); return; }
+  var lines = raw.replace(/\r/g, '').split('\n').filter(function (l) { return l.trim() !== ''; });
+  var delim = lines[0].indexOf('\t') !== -1 ? '\t' : ',';
+  var editableHeaders = state.headers.filter(function (h) { return ['產生狀態', '產生時間', '圖片連結'].indexOf(h) === -1; });
+
+  var firstCells = lines[0].split(delim).map(function (s) { return s.trim(); });
+  var headerMatches = firstCells.length > 1 && firstCells.every(function (c) { return editableHeaders.indexOf(c) !== -1; });
+  var dataLines = headerMatches ? lines.slice(1) : lines;
+  var useHeaders = headerMatches ? firstCells : editableHeaders;
+
+  var parsed = dataLines.map(function (line) {
+    var cells = line.split(delim);
+    var obj = {};
+    useHeaders.forEach(function (h, i) { obj[h] = (cells[i] || '').trim(); });
+    return obj;
+  }).filter(function (o) { return Object.keys(o).some(function (k) { return o[k]; }); });
+
+  state._pendingBulk = parsed;
+  var preview = $('#bulkPreview');
+  if (!parsed.length) {
+    preview.innerHTML = '<div class="hint">沒有解析到有效資料，請確認格式（可直接從 Excel 複製多列多欄後貼上）。</div>';
+    $('#btnConfirmBulk').style.display = 'none';
+    return;
+  }
+  var cols = useHeaders;
+  var rowsHtml = parsed.slice(0, 20).map(function (o) {
+    return '<tr>' + cols.map(function (c) { return '<td>' + escapeHtml(o[c]) + '</td>'; }).join('') + '</tr>';
+  }).join('');
+  preview.innerHTML = '<div class="hint">預覽（共 ' + parsed.length + ' 筆' + (parsed.length > 20 ? '，僅顯示前 20 筆' : '') + '）：</div>' +
+    '<div class="table-scroll" style="max-height:220px"><table><thead><tr>' +
+    cols.map(function (c) { return '<th>' + escapeHtml(c) + '</th>'; }).join('') + '</tr></thead><tbody>' + rowsHtml + '</tbody></table></div>';
+  $('#btnConfirmBulk').style.display = 'inline-block';
+}
+
+function confirmBulkImport() {
+  var parsed = state._pendingBulk || [];
+  if (!parsed.length) return;
+  var catRef = currentCategoryObj();
+  if (!catRef) return;
+  busy($('#btnConfirmBulk'), true);
+  runAsync('addNameEntriesBulk', catRef.spreadsheetId, catRef.key, parsed).then(function (data) {
+    state.rows = data.rows; state.headers = data.headers;
+    renderListTable();
+    $('#bulkPasteArea').value = '';
+    $('#bulkPreview').innerHTML = '';
+    $('#btnConfirmBulk').style.display = 'none';
+    state._pendingBulk = null;
+    loadGenerateTab(state.currentCategory);
+    toast('已匯入 ' + parsed.length + ' 筆名單');
+  }).catch(function (err) { toast(err.message, true); }).finally(function () { busy($('#btnConfirmBulk'), false); });
+}
+
+// ============================================================
+// 產生名牌
+// ============================================================
+function renderGenerateEmpty() {
+  $('#genBody').style.display = 'none';
+  $('#genEmpty').style.display = 'block';
+}
+
+function loadGenerateTab(uid) {
+  var catRef = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === uid; })[0];
+  if (!catRef) return;
+  $('#genEmpty').style.display = 'none';
+  $('#genBody').style.display = 'block';
+  $('#genCategorySelect').value = uid;
+  // 自動依背景圖片比例更新名牌尺寸，並記錄為原始尺寸
+  if (catRef.bgFileId) {
+    runAsync('getBackgroundImageData', catRef.spreadsheetId, catRef.key).then(function (bgData) {
+      if (!bgData) return;
+      var w = parseFloat($('#pdfBadgeW').value) || 90;
+      var h = Math.round(w * (bgData.height / bgData.width) * 10) / 10;
+      $('#pdfBadgeW').value = w;
+      $('#pdfBadgeH').value = h;
+      badgeOrigW = w;
+      badgeOrigH = h;
+      if (badgeRatioLocked) badgeLockedAspect = w / h;
+      updateRestoreBtnState();
+      markPdfPreviewStale();
+    }).catch(function () {});
+  }
+  runAsync('getNameList', catRef.spreadsheetId, catRef.key).then(function (data) {
+    var total = data.rows.length;
+    var done = data.rows.filter(function (r) { return r['產生狀態']; }).length;
+    $('#statTotal').textContent = total;
+    $('#statDone').textContent = done;
+    $('#statPending').textContent = total - done;
+    var cat = catRef;
+    var ready = cat && cat.bgFileId && cat.layout && cat.layout.length;
+    var genBtn = $('#btnGenerateAndDownload');
+    if (genBtn) genBtn.disabled = !ready || total === 0;
+    if (!cat || !cat.bgFileId) {
+      $('#genWarn').textContent = '⚠️ 尚未上傳背景圖片，請先到「版面編輯」設定。';
+      $('#genWarn').style.display = 'block';
+    } else if (!cat.layout || !cat.layout.length) {
+      $('#genWarn').textContent = '⚠️ 尚未放置任何欄位版面，請先到「版面編輯」設定文字位置。';
+      $('#genWarn').style.display = 'block';
+    } else {
+      $('#genWarn').style.display = 'none';
+    }
+  }).catch(function (err) { toast(err.message, true); });
+}
+
+function loadImageFromBase64(base64, mimeType) {
+  return new Promise(function (resolve, reject) {
+    var img = new Image();
+    img.onload = function () { resolve(img); };
+    img.onerror = reject;
+    img.src = 'data:' + mimeType + ';base64,' + base64;
+  });
+}
+
+function renderBadgeCanvas(bgImg, nativeW, nativeH, layout, rowData, outputScale) {
+  // outputScale 預設 1（實際輸出解析度=原圖解析度）。PDF 匯出時每張名牌在紙上通常只有幾公分，
+  // 用不到原圖全解析度，會傳一個 <1 的縮放比例，改用較小的畫布省記憶體與 PDF 檔案大小；
+  // 版面座標／字級全部還是照 nativeW/nativeH 算，靠 ctx.scale() 統一縮放，比例不會跑掉。
+  outputScale = outputScale || 1;
+  var canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(nativeW * outputScale));
+  canvas.height = Math.max(1, Math.round(nativeH * outputScale));
+  var ctx = canvas.getContext('2d');
+  ctx.scale(outputScale, outputScale);
+  ctx.fillStyle = '#ffffff'; // 背景圖若有透明區域，PDF 匯出用的 JPEG 不支援透明，先鋪白色墊底避免變黑
+  ctx.fillRect(0, 0, nativeW, nativeH);
+  ctx.drawImage(bgImg, 0, 0, nativeW, nativeH);
+  layout.forEach(function (field) {
+    var text = rowData[field.field];
+    if (text === undefined || text === null || text === '') return;
+    var fit = fitText(text, field, nativeW);
+    ctx.font = (field.bold ? 'bold ' : '') + fit.fontSize + 'px ' + field.fontFamily;
+    ctx.fillStyle = field.color || '#000000';
+    ctx.textAlign = field.align || 'center';
+    ctx.textBaseline = 'middle';
+    var cx = (field.xPct / 100) * nativeW;
+    var cy = (field.yPct / 100) * nativeH;
+    var lineHeight = fit.fontSize * 1.2;
+    var totalH = lineHeight * fit.lines.length;
+    var startY = cy - totalH / 2 + lineHeight / 2;
+    fit.lines.forEach(function (line, i) {
+      ctx.fillText(line, cx, startY + i * lineHeight);
+    });
+  });
+  return canvas;
+}
+
+function buildBadgeFilename(categoryKey, row) {
+  var nameGuess = row['姓名'] || row['身分'] || row['name'] || ('row' + row._rowIndex);
+  return sanitizeFilename(categoryKey + '_' + nameGuess) + '.png';
+}
+
+var generating = false;
+var badgeRatioLocked = true;
+var badgeLockedAspect = 90 / 110;
+var badgeOrigW = null;
+var badgeOrigH = null;
+
+function generateBadges() {
+  if (generating) { toast('產生作業進行中，請稍候'); return; }
+  var catRef = currentCategoryObj();
+  if (!catRef) return;
+  var uid = state.currentCategory;
+
+  generating = true;
+  state.cancelGeneration = false;
+  var genBtn = $('#btnGenerateAndDownload');
+  if (genBtn) genBtn.disabled = true;
+  var cancelBtn = $('#btnCancelGen');
+  if (cancelBtn) { cancelBtn.style.display = 'inline-block'; cancelBtn.disabled = false; cancelBtn.textContent = '⏹ 取消'; }
+
+  Promise.all([runAsync('getNameList', catRef.spreadsheetId, catRef.key), runAsync('getBackgroundImageData', catRef.spreadsheetId, catRef.key), ensureFontsLoaded()])
+    .then(function (results) {
+      var listData = results[0];
+      var bgData = results[1];
+      if (!bgData) throw new Error('尚未上傳背景圖片');
+      if (!bgData.layout || !bgData.layout.length) throw new Error('尚未設定任何欄位版面');
+
+      var rows = getRowsByScope(listData.rows);
+      if (!rows.length) {
+        var scopeMsg = state.exportScope === 'pending' ? '目前沒有未產生的名單' :
+                       state.exportScope === 'checked' ? '請先在「名單管理」勾選要處理的名單' : '名單是空的';
+        toast(scopeMsg, true);
+        return null;
+      }
+
+      return loadImageFromBase64(bgData.base64, bgData.mimeType).then(function (img) {
+        return runGenerationLoop(catRef, rows, img, bgData.width, bgData.height, bgData.layout);
+      });
+    })
+    .then(function (result) {
+      if (!result || result.count === 0) return;
+      downloadZip();
+      var rowIndexes = state.lastGenerated.map(function (item) { return item.rowIndex; }).filter(function (i) { return i >= 0; });
+      if (!rowIndexes.length) return;
+      var saveToDrive = $('#chkSavePngToDrive') && $('#chkSavePngToDrive').checked;
+      if (saveToDrive) {
+        return runDriveSaveLoop(catRef); // saveGeneratedBadge 內部已標記已產生
+      }
+      return runAsync('markRowsGenerated', catRef.spreadsheetId, catRef.key, rowIndexes, 'PNG 下載')
+        .catch(function () {});
+    })
+    .catch(function (err) {
+      if (!state.cancelGeneration) toast(err.message, true);
+    })
+    .finally(function () {
+      generating = false;
+      state.cancelGeneration = false;
+      if (genBtn) genBtn.disabled = false;
+      if (cancelBtn) cancelBtn.style.display = 'none';
+      loadGenerateTab(uid);
+      updateCheckedCountUI();
+    });
+}
+
+function runGenerationLoop(catRef, rows, bgImg, w, h, layout) {
+  var progressWrap = $('#progressWrap');
+  var bar = $('#progressBar');
+  var label = $('#progressLabel');
+  progressWrap.style.display = 'block';
+  state.lastGenerated = [];
+  $('#gallery').innerHTML = '';
+
+  var i = 0;
+  function next() {
+    if (state.cancelGeneration) {
+      progressWrap.style.display = 'none';
+      toast('已取消，共渲染 ' + i + ' 張');
+      return Promise.resolve({ count: i, cancelled: true });
+    }
+    if (i >= rows.length) {
+      bar.style.width = '100%';
+      progressWrap.style.display = 'none';
+      return Promise.resolve({ count: i, cancelled: false });
+    }
+    var row = rows[i];
+    bar.style.width = Math.round((i / rows.length) * 100) + '%';
+    label.textContent = '渲染中… (' + (i + 1) + ' / ' + rows.length + ') ' + (row['姓名'] || '');
+
+    var canvas = renderBadgeCanvas(bgImg, w, h, layout, row);
+    var dataUrl = canvas.toDataURL('image/png');
+    var filename = buildBadgeFilename(catRef.key, row);
+    state.lastGenerated.push({ filename: filename, dataUrl: dataUrl, rowIndex: row._rowIndex });
+    addGalleryItem(dataUrl, filename);
+    i++;
+    return new Promise(function (res) { setTimeout(res, 0); }).then(next);
+  }
+  return next();
+}
+
+function addGalleryItem(dataUrl, filename) {
+  var gallery = $('#gallery');
+  var div = document.createElement('div');
+  div.className = 'item';
+  div.innerHTML = '<img src="' + dataUrl + '"><div class="fn">' + escapeHtml(filename) + '</div>';
+  gallery.appendChild(div);
+}
+
+function downloadZip() {
+  if (!state.lastGenerated.length) { toast('請先產生名牌', true); return; }
+  if (typeof JSZip === 'undefined') { toast('ZIP 套件載入失敗，請重新整理頁面後再試', true); return; }
+  var zip = new JSZip();
+  state.lastGenerated.forEach(function (item) {
+    zip.file(item.filename, item.dataUrl.split(',')[1], { base64: true });
+  });
+  zip.generateAsync({ type: 'blob' }).then(function (blob) {
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    var cat = currentCategoryObj();
+    a.download = sanitizeFilename(cat ? cat.key : 'badge') + '_名牌.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  });
+}
+
+function openDriveFolder() {
+  var cat = currentCategoryObj();
+  if (!cat) return;
+  runAsync('getOutputFolderUrl', cat.spreadsheetId, cat.key)
+    .then(function (url) { window.open(url, '_blank'); })
+    .catch(function (err) { toast(err.message, true); });
+}
+
+function toggleBadgeRatioLock() {
+  badgeRatioLocked = !badgeRatioLocked;
+  var btn = $('#btnLockBadgeRatio');
+  if (badgeRatioLocked) {
+    var w = parseFloat($('#pdfBadgeW').value);
+    var h = parseFloat($('#pdfBadgeH').value);
+    badgeLockedAspect = (w > 0 && h > 0) ? (w / h) : 1;
+    btn.textContent = '🔒';
+    btn.title = '已鎖定比例（' + Math.round(badgeLockedAspect * 100) / 100 + ':1），點擊解鎖';
+    btn.style.color = 'var(--primary)';
+  } else {
+    badgeLockedAspect = null;
+    btn.textContent = '🔓';
+    btn.title = '點此鎖定長寬比';
+    btn.style.color = '';
+  }
+}
+
+function updateRestoreBtnState() {
+  var btn = $('#btnRestoreBadgeRatio');
+  if (!btn) return;
+  var w = parseFloat($('#pdfBadgeW').value);
+  var h = parseFloat($('#pdfBadgeH').value);
+  var atOrig = badgeOrigW != null && badgeOrigH != null &&
+    Math.abs(w - badgeOrigW) < 0.05 && Math.abs(h - badgeOrigH) < 0.05;
+  btn.disabled = atOrig;
+}
+
+function restoreBadgeRatio() {
+  if (badgeOrigW == null || badgeOrigH == null) {
+    toast('尚未載入背景圖片尺寸', true);
+    return;
+  }
+  $('#pdfBadgeW').value = badgeOrigW;
+  $('#pdfBadgeH').value = badgeOrigH;
+  if (badgeRatioLocked) badgeLockedAspect = badgeOrigW / badgeOrigH;
+  updateRestoreBtnState();
+  markPdfPreviewStale();
+  toast('已還原為原始尺寸：' + badgeOrigW + ' × ' + badgeOrigH + ' mm');
+}
+
+function runDriveSaveLoop(catRef) {
+  var progressWrap = $('#progressWrap');
+  var bar = $('#progressBar');
+  var label = $('#progressLabel');
+  progressWrap.style.display = 'block';
+  var items = state.lastGenerated.filter(function (item) { return item.rowIndex >= 0; });
+  var i = 0;
+  function next() {
+    if (i >= items.length) {
+      progressWrap.style.display = 'none';
+      toast('已儲存 ' + items.length + ' 張名牌至 Google Drive');
+      return Promise.resolve();
+    }
+    var item = items[i];
+    bar.style.width = Math.round((i / items.length) * 100) + '%';
+    label.textContent = '儲存至 Drive… (' + (i + 1) + ' / ' + items.length + ') ' + item.filename;
+    return runAsync('saveGeneratedBadge', catRef.spreadsheetId, catRef.key, item.rowIndex, item.dataUrl.split(',')[1], item.filename)
+      .then(function () { i++; return next(); });
+  }
+  return next();
+}
+
+function clearAllGenerationStatus() {
+  var catRef = currentCategoryObj();
+  if (!catRef) return;
+  if (!confirm('確定要清除此類別全部的已產生紀錄嗎？\n（此動作不可復原；下載的檔案不受影響）')) return;
+  runAsync('resetAllGenerationStatus', catRef.spreadsheetId, catRef.key).then(function () {
+    toast('已清除全部生成紀錄');
+    loadGenerateTab(state.currentCategory);
+    if ($('#tab-list').classList.contains('active')) loadNameListTab(state.currentCategory);
+  }).catch(function (err) { toast(err.message, true); });
+}
+
+// ============================================================
+// 匯出 PDF（排版列印用）
+// ============================================================
+var PDF_PAGE_PRESETS = { A4: { w: 210, h: 297 }, Letter: { w: 215.9, h: 279.4 } };
+var PDF_TARGET_DPI = 200; // 印刷用途足夠清楚，同時避免原圖解析度太高時單頁 PDF 爆量
+var pdfExporting = false;
+
+function onPdfPageSizeChanged() {
+  var isCustom = $('#pdfPageSize').value === 'custom';
+  $('#pdfCustomSizeWrap').style.display = isCustom ? 'inline-block' : 'none';
+  $('#pdfOrientationWrap').style.display = isCustom ? 'none' : 'inline-block';
+}
+
+function getPdfPageSizeMm() {
+  var preset = $('#pdfPageSize').value;
+  if (preset === 'custom') {
+    var w = parseFloat($('#pdfCustomW').value);
+    var h = parseFloat($('#pdfCustomH').value);
+    if (!w || !h || w <= 0 || h <= 0) throw new Error('請輸入正確的自訂紙張寬高（mm）');
+    return { w: w, h: h };
+  }
+  var base = PDF_PAGE_PRESETS[preset];
+  var landscape = $('#pdfOrientation').value === 'landscape';
+  return landscape ? { w: base.h, h: base.w } : { w: base.w, h: base.h };
+}
+
+// 依背景圖片的實際長寬比，計算「不旋轉」和「旋轉 90°」兩種擺法各能在一頁塞幾個，
+// 挑張數多的那種。格子尺寸以「名牌實際印出大小」為準（圖片長寬比 contain 到
+// badgeW×badgeH 後的大小），間距也依此計算，不浪費空白行。
+function computeBadgeGrid(pageW, pageH, margin, gap, badgeW, badgeH, badgeAspect) {
+  var availW = pageW - 2 * margin;
+  var availH = pageH - 2 * margin;
+
+  // 將影像 contain 到指定的最大寬高框內，回傳實際尺寸
+  function containFit(maxW, maxH, aspect) {
+    var w = maxW, h = maxH;
+    if (w / h > aspect) { w = h * aspect; } else { h = w / aspect; }
+    return { w: w, h: h };
+  }
+
+  // 不旋轉：影像 contain 在 badgeW × badgeH 內
+  var normalFit = containFit(badgeW, badgeH, badgeAspect);
+  // 旋轉 90°：影像先旋轉（長寬比變為 1/badgeAspect），再 contain 在 badgeH × badgeW 內
+  var rotatedFit = containFit(badgeH, badgeW, 1 / badgeAspect);
+
+  function tryFit(slotW, slotH) {
+    var cols = Math.max(0, Math.floor((availW + gap) / (slotW + gap)));
+    var rows = Math.max(0, Math.floor((availH + gap) / (slotH + gap)));
+    return { cols: cols, rows: rows, count: cols * rows };
+  }
+
+  var normalGrid = tryFit(normalFit.w, normalFit.h);
+  var rotatedGrid = tryFit(rotatedFit.w, rotatedFit.h);
+  var rotate = rotatedGrid.count > normalGrid.count;
+  var chosenGrid = rotate ? rotatedGrid : normalGrid;
+  var chosenFit = rotate ? rotatedFit : normalFit;
+
+  if (!chosenGrid.count) throw new Error('這個名牌尺寸太大，一頁連一個都放不下，請調小名牌尺寸或邊界/間距');
+
+  var slots = [];
+  for (var r = 0; r < chosenGrid.rows; r++) {
+    for (var c = 0; c < chosenGrid.cols; c++) {
+      slots.push({
+        x: margin + c * (chosenFit.w + gap),
+        y: margin + r * (chosenFit.h + gap),
+        w: chosenFit.w, h: chosenFit.h,
+        rotate: rotate
+      });
+    }
+  }
+  return slots;
+}
+
+function rotateCanvas90(sourceCanvas) {
+  var rotated = document.createElement('canvas');
+  rotated.width = sourceCanvas.height;
+  rotated.height = sourceCanvas.width;
+  var ctx = rotated.getContext('2d');
+  ctx.translate(rotated.width / 2, rotated.height / 2);
+  ctx.rotate(Math.PI / 2);
+  ctx.drawImage(sourceCanvas, -sourceCanvas.width / 2, -sourceCanvas.height / 2);
+  return rotated;
+}
+
+function exportPdf() {
+  if (pdfExporting) { toast('PDF 產生中，請稍候'); return; }
+  var catRef = currentCategoryObj();
+  if (!catRef) return;
+  if (typeof window.jspdf === 'undefined') { toast('PDF 套件載入失敗，請檢查網路連線後重新整理頁面', true); return; }
+
+  var badgeW = parseFloat($('#pdfBadgeW').value);
+  var badgeH = parseFloat($('#pdfBadgeH').value);
+  if (!badgeW || !badgeH || badgeW <= 0 || badgeH <= 0) { toast('請輸入正確的名牌寬高（mm）', true); return; }
+  var gap = parseFloat($('#pdfGap').value) || 0;
+  var margin = parseFloat($('#pdfMargin').value) || 0;
+  var blankCount = Math.max(0, parseInt($('#pdfBlankCount').value) || 0);
+  var pageSize;
+  try { pageSize = getPdfPageSizeMm(); } catch (err) { toast(err.message, true); return; }
+
+  pdfExporting = true;
+  busy($('#btnExportPdf'), true);
+
+  Promise.all([runAsync('getNameList', catRef.spreadsheetId, catRef.key), runAsync('getBackgroundImageData', catRef.spreadsheetId, catRef.key), ensureFontsLoaded()])
+    .then(function (results) {
+      var listData = results[0];
+      var bgData = results[1];
+      if (!bgData) throw new Error('尚未上傳背景圖片');
+      if (!bgData.layout || !bgData.layout.length) throw new Error('尚未設定任何欄位版面');
+
+      var rowsData = getRowsByScope(listData.rows);
+      // 額外空白名牌（_rowIndex 用負數識別，不會被標記為已產生）
+      var blankRows = [];
+      for (var b = 0; b < blankCount; b++) blankRows.push({ _rowIndex: -(b + 1) });
+      var allRows = rowsData.concat(blankRows);
+      if (!allRows.length) throw new Error('沒有符合條件的名單（請確認名單是否為空，或勾選特定幾筆，或增加額外空白名牌數量）');
+
+      var slots = computeBadgeGrid(pageSize.w, pageSize.h, margin, gap, badgeW, badgeH, bgData.width / bgData.height);
+      var firstSlot = slots[0];
+      var targetPxW = (firstSlot.w / 25.4) * PDF_TARGET_DPI;
+      // 旋轉後的畫布寬對應的是原圖的高（nativeH），需用對應維度算縮放比
+      var outputScale = firstSlot.rotate ? (targetPxW / bgData.height) : (targetPxW / bgData.width);
+
+      return loadImageFromBase64(bgData.base64, bgData.mimeType).then(function (img) {
+        return runPdfExportLoop(catRef, allRows, img, bgData.width, bgData.height, bgData.layout, pageSize, slots, outputScale, blankCount);
+      }).then(function (loopResult) {
+        var filename = sanitizeFilename(catRef.key) + '_名牌.pdf';
+        loopResult.pdf.save(filename);
+        var realCount = allRows.length - blankCount;
+        var blankMsg = blankCount ? ('＋' + blankCount + ' 張空白') : '';
+        toast('PDF 已產生，共 ' + realCount + ' 張命名名牌' + blankMsg + '、' +
+          Math.ceil(allRows.length / loopResult.perPage) + ' 頁（每頁 ' + loopResult.perPage + ' 個）');
+        var chain = markRowsGeneratedAfterPdf(catRef, loopResult.doneRowIndexes);
+        if ($('#chkSavePdfToDrive') && $('#chkSavePdfToDrive').checked) {
+          chain = chain.then(function () {
+            $('#pdfProgressLabel').textContent = 'PDF 上傳至 Drive 中…';
+            $('#pdfProgressWrap').style.display = 'block';
+            var base64 = loopResult.pdf.output('datauristring').split(',')[1];
+            return runAsync('savePdfToDrive', catRef.spreadsheetId, catRef.key, base64, filename)
+              .then(function () { toast('PDF 已儲存至 Google Drive'); })
+              .catch(function (err) { toast('PDF 已下載，但 Drive 儲存失敗：' + err.message, true); })
+              .finally(function () { $('#pdfProgressWrap').style.display = 'none'; });
+          });
+        }
+        return chain;
+      });
+    })
+    .catch(function (err) { toast(err.message, true); })
+    .finally(function () {
+      pdfExporting = false;
+      busy($('#btnExportPdf'), false);
+      $('#pdfProgressWrap').style.display = 'none';
+    });
+}
+
+function runPdfExportLoop(catRef, rows, bgImg, w, h, layout, pageSize, slots, outputScale, blankCount) {
+  var progressWrap = $('#pdfProgressWrap');
+  var bar = $('#pdfProgressBar');
+  var label = $('#pdfProgressLabel');
+  progressWrap.style.display = 'block';
+
+  var perPage = slots.length;
+  // 紙張是直是橫，要明確告訴 jsPDF，不然它只認 format 陣列裡的數字、預設仍當直式處理
+  var orientation = pageSize.w > pageSize.h ? 'landscape' : 'portrait';
+  var pdf = new window.jspdf.jsPDF({ unit: 'mm', format: [pageSize.w, pageSize.h], orientation: orientation });
+  var doneRowIndexes = [];
+
+  var i = 0;
+  function next() {
+    if (i >= rows.length) {
+      progressWrap.style.display = 'none';
+      return Promise.resolve({ pdf: pdf, doneRowIndexes: doneRowIndexes, perPage: perPage });
+    }
+    var row = rows[i];
+    var isBlank = row._rowIndex < 0;
+    label.textContent = '排版中… (' + (i + 1) + ' / ' + rows.length + ') ' + (isBlank ? '空白名牌' : (row['姓名'] || ''));
+    bar.style.width = Math.round((i / rows.length) * 100) + '%';
+
+    var slotIdx = i % perPage;
+    if (i > 0 && slotIdx === 0) pdf.addPage([pageSize.w, pageSize.h], orientation);
+    var slot = slots[slotIdx];
+
+    // 空白名牌傳空物件，renderBadgeCanvas 會跳過所有欄位只保留背景
+    var canvas = renderBadgeCanvas(bgImg, w, h, layout, isBlank ? {} : row, outputScale);
+    if (slot.rotate) canvas = rotateCanvas90(canvas);
+    var dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+    pdf.addImage(dataUrl, 'JPEG', slot.x, slot.y, slot.w, slot.h);
+    if (!isBlank) doneRowIndexes.push(row._rowIndex);
+
+    i++;
+    return new Promise(function (res) { setTimeout(res, 0); }).then(next);
+  }
+  return next();
+}
+
+function markRowsGeneratedAfterPdf(catRef, rowIndexes) {
+  // 過濾掉空白名牌（負數 index），只標記真實名單列
+  var realIndexes = rowIndexes.filter(function (idx) { return idx >= 0; });
+  if (!realIndexes.length) return Promise.resolve();
+  var uid = categoryUid(catRef.spreadsheetId, catRef.key);
+  return runAsync('markRowsGenerated', catRef.spreadsheetId, catRef.key, realIndexes, 'PDF 匯出').then(function () {
+    if (state.currentCategory === uid) {
+      loadGenerateTab(uid);
+      if (document.getElementById('tab-list').classList.contains('active')) loadNameListTab(uid);
+    }
+  }).catch(function (err) { toast('PDF 已下載，但更新產生狀態時發生錯誤：' + err.message, true); });
+}
+
+// ============================================================
+// PDF 版面預覽
+// ============================================================
+function markPdfPreviewStale() {
+  var stale = $('#pdfPreviewStale');
+  if (stale) stale.style.display = 'inline';
+}
+
+function drawPdfPagePreview(pageW, pageH, margin, slots) {
+  var canvas = $('#pdfLayoutCanvas');
+  var maxW = 240, maxH = 340;
+  var scale = Math.min(maxW / pageW, maxH / pageH);
+  canvas.width = Math.round(pageW * scale);
+  canvas.height = Math.round(pageH * scale);
+  var ctx = canvas.getContext('2d');
+
+  // 紙張底色
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // 邊界虛線
+  ctx.setLineDash([3, 3]);
+  ctx.strokeStyle = '#94a3b8';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(margin * scale, margin * scale,
+    (pageW - 2 * margin) * scale, (pageH - 2 * margin) * scale);
+  ctx.setLineDash([]);
+
+  // 名牌格子
+  slots.forEach(function (slot, i) {
+    var sx = slot.x * scale, sy = slot.y * scale, sw = slot.w * scale, sh = slot.h * scale;
+    var hue = (i * 51 + 195) % 360;
+    ctx.fillStyle = 'hsla(' + hue + ',65%,80%,.55)';
+    ctx.fillRect(sx, sy, sw, sh);
+    ctx.strokeStyle = 'hsl(' + hue + ',60%,40%)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(sx + .5, sy + .5, sw - 1, sh - 1);
+    // 對角線（旋轉後方向改變，可目視確認）
+    ctx.strokeStyle = 'hsl(' + hue + ',50%,35%)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx + sw, sy + sh); ctx.stroke();
+    // 左上角紅點（原始頂點，旋轉後應跑到左下角）
+    ctx.fillStyle = '#e11d48';
+    ctx.beginPath();
+    ctx.arc(sx + 3, sy + 3, Math.max(2, Math.min(4, sw * 0.07)), 0, Math.PI * 2);
+    ctx.fill();
+    // 格子編號
+    ctx.fillStyle = 'hsl(' + hue + ',60%,20%)';
+    var fs = Math.max(7, Math.min(12, sh * 0.22));
+    ctx.font = 'bold ' + fs + 'px Arial';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(i + 1, sx + sw / 2, sy + sh / 2);
+  });
+
+  // 紙張外框
+  ctx.strokeStyle = '#64748b';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(.5, .5, canvas.width - 1, canvas.height - 1);
+}
+
+function previewPdfLayout() {
+  var catRef = currentCategoryObj();
+  if (!catRef) { toast('請先選擇類別', true); return; }
+
+  var badgeW = parseFloat($('#pdfBadgeW').value);
+  var badgeH = parseFloat($('#pdfBadgeH').value);
+  if (!badgeW || !badgeH || badgeW <= 0 || badgeH <= 0) { toast('請輸入正確的名牌寬高（mm）', true); return; }
+  var gap = parseFloat($('#pdfGap').value) || 0;
+  var margin = parseFloat($('#pdfMargin').value) || 0;
+  var blankCount = Math.max(0, parseInt($('#pdfBlankCount').value) || 0);
+  var pageSize;
+  try { pageSize = getPdfPageSizeMm(); } catch (err) { toast(err.message, true); return; }
+
+  busy($('#btnPreviewPdf'), true);
+
+  Promise.all([
+    runAsync('getNameList', catRef.spreadsheetId, catRef.key),
+    runAsync('getBackgroundImageData', catRef.spreadsheetId, catRef.key),
+    ensureFontsLoaded()
+  ]).then(function (results) {
+    var listData = results[0];
+    var bgData = results[1];
+    if (!bgData) throw new Error('尚未上傳背景圖片');
+
+    var slots = computeBadgeGrid(pageSize.w, pageSize.h, margin, gap, badgeW, badgeH, bgData.width / bgData.height);
+    var firstSlot = slots[0];
+    var rotate = firstSlot.rotate;
+    var targetPxW = (firstSlot.w / 25.4) * PDF_TARGET_DPI;
+    var outputScale = rotate ? (targetPxW / bgData.height) : (targetPxW / bgData.width);
+
+    // 顯示預覽區
+    $('#pdfPreviewSection').style.display = 'block';
+    $('#pdfPreviewStale').style.display = 'none';
+
+    // 繪製頁面格子
+    drawPdfPagePreview(pageSize.w, pageSize.h, margin, slots);
+
+    // 統計資訊
+    var rowsData = getRowsByScope(listData.rows);
+    var totalBadges = rowsData.length + blankCount;
+    var totalPages = Math.ceil(totalBadges / slots.length);
+    $('#pdfLayoutStats').innerHTML =
+      '<table style="font-size:12.5px;border-collapse:collapse">' +
+      '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">每頁名牌數</td><td><strong>' + slots.length + ' 個</strong></td></tr>' +
+      '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">格子尺寸</td><td><strong>' + firstSlot.w.toFixed(1) + '&times;' + firstSlot.h.toFixed(1) + ' mm</strong></td></tr>' +
+      '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">名牌旋轉</td><td><strong>' + (rotate ? '是（旋轉 90° 以排更多）' : '否') + '</strong></td></tr>' +
+      '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">名單筆數</td><td><strong>' + rowsData.length + ' 筆' + (blankCount ? '＋' + blankCount + ' 空白' : '') + '</strong></td></tr>' +
+      '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">預計頁數</td><td><strong>' + totalPages + ' 頁</strong></td></tr>' +
+      '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">紙張</td><td><strong>' + pageSize.w + '&times;' + pageSize.h + ' mm</strong></td></tr>' +
+      '</table>';
+
+  }).catch(function (err) { toast(err.message, true); })
+    .finally(function () { busy($('#btnPreviewPdf'), false); });
+}
+
+// 下載空白版型 PDF（僅背景圖、無文字），使用 PDF 匯出頁的紙張 / 名牌尺寸設定，一頁排滿
+function downloadBlankBadgePdf() {
+  if (pdfExporting) { toast('PDF 產生中，請稍候'); return; }
+  var catRef = currentCategoryObj();
+  if (!catRef) { toast('請先選擇類別', true); return; }
+  if (typeof window.jspdf === 'undefined') { toast('PDF 套件載入失敗，請重新整理頁面', true); return; }
+
+  var badgeW = parseFloat($('#pdfBadgeW').value);
+  var badgeH = parseFloat($('#pdfBadgeH').value);
+  if (!badgeW || !badgeH || badgeW <= 0 || badgeH <= 0) { toast('請輸入正確的名牌寬高（mm）', true); return; }
+  var gap = parseFloat($('#pdfGap').value) || 0;
+  var margin = parseFloat($('#pdfMargin').value) || 0;
+  var pageSize;
+  try { pageSize = getPdfPageSizeMm(); } catch (err) { toast(err.message, true); return; }
+
+  pdfExporting = true;
+  busy($('#btnDownloadBlankPdf'), true);
+
+  Promise.all([runAsync('getBackgroundImageData', catRef.spreadsheetId, catRef.key), ensureFontsLoaded()])
+    .then(function (results) {
+      var bgData = results[0];
+      if (!bgData) throw new Error('尚未上傳背景圖片');
+
+      var slots = computeBadgeGrid(pageSize.w, pageSize.h, margin, gap, badgeW, badgeH, bgData.width / bgData.height);
+      var firstSlot = slots[0];
+      var targetPxW = (firstSlot.w / 25.4) * PDF_TARGET_DPI;
+      var outputScale = firstSlot.rotate ? (targetPxW / bgData.height) : (targetPxW / bgData.width);
+
+      return loadImageFromBase64(bgData.base64, bgData.mimeType).then(function (img) {
+        var orientation = pageSize.w > pageSize.h ? 'landscape' : 'portrait';
+        var pdf = new window.jspdf.jsPDF({ unit: 'mm', format: [pageSize.w, pageSize.h], orientation: orientation });
+
+        // 空白畫布只有背景，layout 傳空陣列
+        var blankCanvas = renderBadgeCanvas(img, bgData.width, bgData.height, [], {}, outputScale);
+        var blankCanvasRotated = rotateCanvas90(blankCanvas);
+
+        slots.forEach(function (slot) {
+          var dataUrl = (slot.rotate ? blankCanvasRotated : blankCanvas).toDataURL('image/jpeg', 0.92);
+          pdf.addImage(dataUrl, 'JPEG', slot.x, slot.y, slot.w, slot.h);
+        });
+
+        pdf.save(sanitizeFilename(catRef.key) + '_空白版型.pdf');
+        toast('已下載空白版型 PDF（一頁共 ' + slots.length + ' 個）');
+      });
+    })
+    .catch(function (err) { toast(err.message, true); })
+    .finally(function () {
+      pdfExporting = false;
+      busy($('#btnDownloadBlankPdf'), false);
+    });
+}
+</script>

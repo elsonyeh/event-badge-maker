@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<!-- 名牌產生器 | Author: Elson Yeh <elson921121@gmail.com> | v5.7 | 2026/08/11 -->
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>名牌產生器</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700&family=Noto+Serif+TC:wght@400;700&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <?!= include('Stylesheet'); ?>
+</head>
+<body>
+<div id="app">
+
+  <header class="topbar">
+    <h1>🪪 名牌產生器</h1>
+    <div class="sheet-status">
+      <span class="dot off" id="connDot"></span>
+      <span id="connLabel">尚未連結試算表</span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button data-tab="settings" class="active">① 活動設定</button>
+    <button data-tab="layout" disabled>② 版面編輯</button>
+    <button data-tab="list" disabled>③ 名單管理</button>
+    <button data-tab="generate" disabled>④ 產生名牌</button>
+  </nav>
+
+  <main>
+
+    <!-- ===================== 活動設定 ===================== -->
+    <section class="tabpanel active" id="tab-settings">
+
+      <div class="card">
+        <h3>連結活動試算表</h3>
+        <p class="hint">每一次活動用一份 Google 試算表存放名單與設定。換活動時換連結即可，
+          也可以同時連結好幾份以區分不同類別，各自連結進來後類別清單會自動
+          彙總在一起，每個類別會標明是來自哪一份。</p>
+
+        <div id="connectedSheetsList" class="cat-grid"></div>
+
+        <div id="recentSheetsWrap" style="display:none;margin-top:12px">
+          <h4>最近使用過</h4>
+          <div id="recentSheetsList"></div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+        <div id="connectForm" class="row">
+          <input type="url" id="sheetUrlInput" class="grow" placeholder="貼上 Google 試算表網址，例如 https://docs.google.com/spreadsheets/d/xxxx/edit">
+          <button class="primary" id="btnConnect">連結</button>
+          <button id="btnCreateNew">建立新的活動試算表</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>名牌類別</h3>
+        <p class="hint">一個類別 = 一種名牌樣式（各自有自己的背景圖片、版面與名單分頁）。例如：學員 / 工作人員 / 講師貴賓。</p>
+        <div class="cat-grid" id="catGrid"></div>
+
+        <div class="row" id="targetSheetRow" style="display:none;margin-top:12px">
+          <label>下面的新增動作要套用到哪一份試算表：<select id="newCatTargetSheet"></select></label>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <button id="btnSetupDefaults">快速建立範本類別（學員／工作人員／講師貴賓）</button>
+          <span class="hint">建立新活動試算表時會自動套用；已存在的類別不會被覆蓋。</span>
+        </div>
+
+        <div id="adoptWrap" style="display:none">
+          <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+          <h4>偵測到還有其他分頁尚未登記為類別</h4>
+          <p class="hint">如果分頁裡已經有名單資料，可以直接採用為類別，
+            會直接讀取該分頁目前的標題列當欄位，不用重新輸入。</p>
+          <div id="adoptList"></div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+        <h4>自訂新增類別</h4>
+        <div class="row">
+          <input type="text" id="newCatKey" class="grow" placeholder="類別代碼（作為分頁名稱，例如：學員）">
+          <input type="text" id="newCatDisplay" class="grow" placeholder="顯示名稱（可留空，預設同代碼）">
+          <button class="primary" id="btnAddCategory">新增類別</button>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <input type="text" id="newCatHeaders" style="flex:1;min-width:180px" placeholder="欄位名稱，用逗號分隔（例如：身分,姓名,組別；留空預設只有「姓名」）">
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== 版面編輯 ===================== -->
+    <section class="tabpanel" id="tab-layout">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <div class="row">
+            <label>類別：</label>
+            <select id="layoutCategorySelect"></select>
+          </div>
+        </div>
+      </div>
+
+      <div id="layoutEmpty" class="card empty-state" style="display:none">
+        <div class="big">📇</div>請先在「活動設定」新增或選擇一個名牌類別
+      </div>
+
+      <div id="layoutBody" class="card" style="display:none">
+        <div class="layout-toolbar">
+          <button id="btnUploadBg">⬆️ 上傳 / 更換背景圖片</button>
+          <input type="file" id="bgFileInput" accept="image/*" style="display:none">
+          <button id="btnDownloadBlankBg">⬇️ 下載空白背景</button>
+          <button id="btnAutoArrange">自動排版未放置的欄位</button>
+          <span class="hint" id="bgInfo">尚未上傳背景圖片</span>
+          <span class="hint">・背景圖片大小沒有限制，會依原始解析度輸出（建議 &lt; 20MB 以確保上傳順暢）</span>
+        </div>
+
+        <div class="layout-main">
+          <div class="field-tray">
+            <h4>可用欄位（拖曳到畫布新增）</h4>
+            <div id="fieldTray"></div>
+            <h4 style="margin-top:16px">已放置欄位</h4>
+            <div id="placedList"></div>
+          </div>
+
+          <div class="canvas-wrap">
+            <div class="canvas-toolbar">
+              <button id="btnUndoLayout" disabled title="上一步">↩️ 上一步</button>
+              <button id="btnRedoLayout" disabled title="下一步">↪️ 下一步</button>
+              <button class="primary" id="btnSaveLayout" disabled>💾 儲存版面設定</button>
+            </div>
+            <div class="canvas-stage-center">
+              <div class="editor-stage" id="editorStage">
+                <img class="bg" id="editorBgImg" alt="">
+              </div>
+            </div>
+          </div>
+
+          <div class="props-panel">
+            <h4>欄位樣式</h4>
+            <div id="propsEmpty" class="props-empty">點選畫布上的欄位以編輯樣式</div>
+            <div id="propsForm" class="props-form" style="display:none">
+              <div class="hint">欄位：<b id="propFieldName"></b></div>
+              <label>字級（依原圖解析度計算的像素）</label>
+              <input type="number" id="propFontSize" min="4" max="600">
+              <label>顏色</label>
+              <input type="color" id="propColor">
+              <label>字型</label>
+              <select id="propFontFamily"></select>
+              <label><input type="checkbox" id="propBold" style="width:auto"> 粗體</label>
+              <label>對齊點</label>
+              <select id="propAlign">
+                <option value="center">置中</option>
+                <option value="left">靠左</option>
+                <option value="right">靠右</option>
+              </select>
+              <label>最大寬度（佔畫布寬度 %，超過會自動縮小或換行）</label>
+              <input type="number" id="propMaxWidth" min="5" max="100">
+              <div class="two-col">
+                <div><label>X (%)</label><input type="number" id="propX" step="0.1"></div>
+                <div><label>Y (%)</label><input type="number" id="propY" step="0.1"></div>
+              </div>
+              <div class="two-col" style="margin-top:8px">
+                <button id="btnCenterH" style="flex:1">⬌ 水平置中</button>
+                <button id="btnCenterV" style="flex:1">⬍ 垂直置中</button>
+              </div>
+              <button class="danger" id="btnRemoveField" style="margin-top:12px;width:100%">移除此欄位</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== 名單管理 ===================== -->
+    <section class="tabpanel" id="tab-list">
+      <div class="card">
+        <label>類別：</label>
+        <select id="listCategorySelect"></select>
+      </div>
+
+      <div id="listEmpty" class="card empty-state" style="display:none">
+        <div class="big">📋</div>請先在「活動設定」新增或選擇一個名牌類別
+      </div>
+
+      <div id="listBody" style="display:none">
+        <div class="card">
+          <div class="row" style="justify-content:space-between">
+            <h3 style="margin:0">目前名單</h3>
+            <span class="hint checked-count-label">未勾選（預設處理全部名單）</span>
+          </div>
+          <p class="hint">勾選左邊的核取方塊可以只針對「這幾筆」產生名牌，不勾則預設處理全部名單。</p>
+          <div id="listTableWrap"></div>
+        </div>
+
+        <div class="card">
+          <h3 id="addEntryTitle">新增一筆</h3>
+          <div class="row" id="addEntryFields"></div>
+          <div class="row" style="margin-top:10px">
+            <button class="primary" id="btnAddEntry">新增</button>
+            <button id="btnCancelEdit" style="display:none">取消編輯</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>批次匯入</h3>
+          <p class="hint">兩種方式擇一：上傳本機的 Excel／CSV 檔案，或直接從 Excel／Google 試算表選取多列多欄複製、
+            貼到下方文字框。若資料第一列是欄位名稱會自動辨識，兩種方式都會先預覽再匯入。
+            上傳 Excel 檔案一律只讀取第一個工作表，若檔案裡有多個工作表，請先另存成只有一個工作表再上傳。</p>
+          <div class="row">
+            <button id="btnUploadExcel">📄 上傳 Excel / CSV 檔案</button>
+            <input type="file" id="excelFileInput" accept=".xlsx,.xls,.csv" style="display:none">
+            <span class="hint" id="excelFileInfo"></span>
+          </div>
+          <textarea id="bulkPasteArea" placeholder="直接貼上 TSV / CSV 資料" style="margin-top:8px"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button id="btnParseBulk">解析預覽</button>
+            <button class="primary" id="btnConfirmBulk" style="display:none">確認匯入</button>
+          </div>
+          <div id="bulkPreview" style="margin-top:10px"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== 產生名牌 ===================== -->
+    <section class="tabpanel" id="tab-generate">
+      <div class="card">
+        <label>類別：</label>
+        <select id="genCategorySelect"></select>
+      </div>
+
+      <div id="genEmpty" class="card empty-state" style="display:none">
+        <div class="big">🖨️</div>請先在「活動設定」新增或選擇一個名牌類別
+      </div>
+
+      <div id="genBody" style="display:none">
+
+        <!-- 統計 + 輸出範圍 -->
+        <div class="card">
+          <div class="hint" id="genWarn" style="display:none;color:#b06000;margin-bottom:10px;"></div>
+          <div class="stat-row">
+            <div class="stat-box"><div class="num" id="statTotal">0</div><div class="lbl">總名單數</div></div>
+            <div class="stat-box"><div class="num" id="statDone">0</div><div class="lbl">已產生</div></div>
+            <div class="stat-box"><div class="num" id="statPending">0</div><div class="lbl">未產生</div></div>
+          </div>
+          <div class="row" style="margin-top:12px;align-items:center;flex-wrap:wrap;gap:8px">
+            <span class="hint" style="flex-shrink:0">輸出範圍：</span>
+            <button class="scope-btn primary" data-scope="all">全部名單</button>
+            <button class="scope-btn" data-scope="pending">只處理未產生的</button>
+            <button class="scope-btn" id="scopeBtnChecked" data-scope="checked" disabled>只處理勾選的</button>
+            <span class="hint checked-count-label" style="flex-shrink:0"></span>
+            <div style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
+              <button class="small danger" id="btnClearAllStatus">🗑️ 清除全部生成紀錄</button>
+              <button class="small" id="btnOpenFolder">📁 開啟 Google Drive 資料夾</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 匯出下載（圖片 / PDF 二合一） -->
+        <div class="card">
+          <h3>匯出下載</h3>
+          <div class="row" style="margin-bottom:12px">
+            <button class="export-tab-btn primary" data-export-tab="image">📷 PNG 圖片</button>
+            <button class="export-tab-btn" data-export-tab="pdf">📄 PDF 列印</button>
+          </div>
+
+          <!-- ── 圖片匯出 ── -->
+          <div id="exportImagePanel">
+            <div class="row">
+              <button class="primary" id="btnGenerateAndDownload">⬇ 下載 ZIP</button>
+              <button id="btnCancelGen" style="display:none">⏹ 取消</button>
+            </div>
+            <div class="row" style="margin-top:6px">
+              <label class="hint"><input type="checkbox" id="chkSavePngToDrive" style="width:auto;margin-right:4px">同時儲存 PNG 至 Google Drive</label>
+            </div>
+            <div class="progress-wrap" id="progressWrap">
+              <div class="progress-bar"><div id="progressBar"></div></div>
+              <div class="progress-label" id="progressLabel"></div>
+            </div>
+            <div class="gallery" id="gallery"></div>
+          </div>
+
+          <!-- ── PDF 匯出 ── -->
+          <div id="exportPdfPanel" style="display:none">
+            <div class="row">
+              <label>紙張
+                <select id="pdfPageSize">
+                  <option value="A4">A4</option>
+                  <option value="Letter">Letter</option>
+                  <option value="custom">自訂尺寸</option>
+                </select>
+              </label>
+              <label id="pdfOrientationWrap">方向
+                <select id="pdfOrientation">
+                  <option value="portrait">直式</option>
+                  <option value="landscape">橫式</option>
+                </select>
+              </label>
+              <span id="pdfCustomSizeWrap" style="display:none">
+                <input type="number" id="pdfCustomW" placeholder="寬(mm)" style="width:80px">
+                ×
+                <input type="number" id="pdfCustomH" placeholder="高(mm)" style="width:80px">
+              </span>
+            </div>
+            <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:10px">
+              <label>名牌寬度(mm) <input type="number" id="pdfBadgeW" min="10" max="500" value="90" style="width:70px"></label>
+              <label>名牌高度(mm) <input type="number" id="pdfBadgeH" min="10" max="500" value="110" style="width:70px"></label>
+              <button id="btnLockBadgeRatio" title="已鎖定比例，點擊解鎖" style="padding:5px 9px;font-size:15px;line-height:1;color:var(--primary)">🔒</button>
+              <button id="btnRestoreBadgeRatio" class="small" title="依背景圖片原始比例調整高度">還原原始尺寸</button>
+              <label>間距(mm) <input type="number" id="pdfGap" min="0" max="30" value="5" style="width:60px"></label>
+              <label>邊界(mm) <input type="number" id="pdfMargin" min="0" max="40" value="10" style="width:60px"></label>
+              <label title="在命名名牌後面額外附加的空白名牌張數">
+                空白名牌張數 <input type="number" id="pdfBlankCount" min="0" max="500" value="0" style="width:65px">
+              </label>
+            </div>
+            <div class="row" style="margin-top:10px;flex-wrap:wrap;gap:8px">
+              <button id="btnPreviewPdf">🔍 預覽版面</button>
+              <button class="primary" id="btnExportPdf">📄 匯出命名名牌 PDF</button>
+              <button id="btnDownloadBlankPdf">⬇️ 下載空白版型 PDF</button>
+            </div>
+            <div class="row" style="margin-top:6px">
+              <label class="hint"><input type="checkbox" id="chkSavePdfToDrive" style="width:auto;margin-right:4px">同時儲存 PDF 至 Google Drive</label>
+            </div>
+
+            <!-- PDF 版面預覽 -->
+            <div id="pdfPreviewSection" style="display:none;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <h4 style="margin:0;font-size:13px">版面預覽</h4>
+                <span class="hint" id="pdfPreviewStale" style="display:none;color:#b06000">⚠️ 設定已變更，請重新點「預覽版面」</span>
+              </div>
+              <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
+                <div>
+                  <canvas id="pdfLayoutCanvas" style="border:1px solid var(--border);border-radius:6px;display:block"></canvas>
+                  <div class="hint" style="text-align:center;margin-top:4px">頁面配置</div>
+                </div>
+                <div id="pdfLayoutStats" style="min-width:180px"></div>
+              </div>
+
+            </div>
+
+            <div class="progress-wrap" id="pdfProgressWrap">
+              <div class="progress-bar"><div id="pdfProgressBar"></div></div>
+              <div class="progress-label" id="pdfProgressLabel"></div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+  </main>
+
+  <div class="toast" id="toast"></div>
+</div>
+
+<?!= include('JavaScript'); ?>
+<footer style="text-align:center;padding:18px;font-size:12px;color:var(--text-soft);border-top:1px solid var(--border);margin-top:8px">
+  © 2026 Elson Yeh &nbsp;·&nbsp; v5.7
+</footer>
+</body>
+</html>

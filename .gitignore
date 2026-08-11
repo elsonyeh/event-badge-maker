@@ -1,0 +1,6 @@
+# 系統檔
+.DS_Store
+Thumbs.db
+
+# 假資料（測試用）
+假資料.csv
