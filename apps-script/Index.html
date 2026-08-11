@@ -14,6 +14,7 @@
   <?!= include('Stylesheet'); ?>
 </head>
 <body>
+<div id="loadingBar" aria-hidden="true"></div>
 <div id="app">
 
   <header class="topbar">
@@ -61,6 +62,27 @@
         <h3>名牌類別</h3>
         <p class="hint">一個類別 = 一種名牌樣式（各自有自己的背景圖片、版面與名單分頁）。例如：學員 / 工作人員 / 講師貴賓。</p>
         <div class="cat-grid" id="catGrid"></div>
+        <div id="copyLayoutPanel" style="display:none;margin-top:10px;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:8px">
+          <!-- Step 1：選擇目標類別 -->
+          <div id="copyStep1">
+            <span class="hint" id="copyLayoutLabel"></span>
+            <div class="row" style="margin-top:8px">
+              <select id="copyLayoutTarget" style="flex:1"></select>
+              <button class="primary small" id="btnCopyLayoutNext">下一步 →</button>
+              <button class="small" id="btnCopyLayoutCancel">取消</button>
+            </div>
+          </div>
+          <!-- Step 2：欄位對應 -->
+          <div id="copyStep2" style="display:none">
+            <p class="hint" style="margin:0 0 8px">設定欄位對應。名稱相符者已自動配對，不相符的欄位可手動選擇要對應哪個目標欄位，或選「不套用」跳過：</p>
+            <div id="copyFieldMapping" style="margin-bottom:10px"></div>
+            <div class="row">
+              <button class="primary small" id="btnCopyLayoutConfirm">確認複製</button>
+              <button class="small" id="btnCopyLayoutBack">← 上一步</button>
+              <button class="small" id="btnCopyLayoutCancel2">取消</button>
+            </div>
+          </div>
+        </div>
 
         <div class="row" id="targetSheetRow" style="display:none;margin-top:12px">
           <label>下面的新增動作要套用到哪一份試算表：<select id="newCatTargetSheet"></select></label>
@@ -112,7 +134,7 @@
           <button id="btnUploadBg">⬆️ 上傳 / 更換背景圖片</button>
           <input type="file" id="bgFileInput" accept="image/*" style="display:none">
           <button id="btnDownloadBlankBg">⬇️ 下載空白背景</button>
-          <button id="btnAutoArrange">自動排版未放置的欄位</button>
+          <button id="btnAutoArrange">自動排版所有欄位</button>
           <span class="hint" id="bgInfo">尚未上傳背景圖片</span>
           <span class="hint">・背景圖片大小沒有限制，會依原始解析度輸出（建議 &lt; 20MB 以確保上傳順暢）</span>
         </div>
@@ -130,41 +152,97 @@
               <button id="btnUndoLayout" disabled title="上一步">↩️ 上一步</button>
               <button id="btnRedoLayout" disabled title="下一步">↪️ 下一步</button>
               <button class="primary" id="btnSaveLayout" disabled>💾 儲存版面設定</button>
+              <label style="margin-left:auto;font-size:13px;display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap">
+                <input type="checkbox" id="snapToggle" checked style="width:auto"> 🧲 格線吸附
+              </label>
             </div>
             <div class="canvas-stage-center">
               <div class="editor-stage" id="editorStage">
                 <img class="bg" id="editorBgImg" alt="">
+                <div class="guide-h" data-guide="33.33" style="top:33.33%"></div>
+                <div class="guide-h" data-guide="50"    style="top:50%"></div>
+                <div class="guide-h" data-guide="66.67" style="top:66.67%"></div>
+                <div class="guide-v" data-guide="33.33" style="left:33.33%"></div>
+                <div class="guide-v" data-guide="50"    style="left:50%"></div>
+                <div class="guide-v" data-guide="66.67" style="left:66.67%"></div>
+                <div id="stageLoadingOverlay" style="display:none;position:absolute;inset:0;background:rgba(255,255,255,0.8);z-index:20;align-items:center;justify-content:center">
+                  <div class="spinner"></div>
+                </div>
               </div>
             </div>
           </div>
 
           <div class="props-panel">
             <h4>欄位樣式</h4>
-            <div id="propsEmpty" class="props-empty">點選畫布上的欄位以編輯樣式</div>
+            <div id="multiAlignPanel" style="display:none;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)">
+              <div class="hint" id="multiAlignCount" style="margin-bottom:8px"></div>
+              <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px">
+                <button onclick="alignSelectedFields('left')" title="靠左對齊" class="small">⬅ 靠左</button>
+                <button onclick="alignSelectedFields('centerH')" title="水平置中" class="small">⬌ 水平</button>
+                <button onclick="alignSelectedFields('right')" title="靠右對齊" class="small">➡ 靠右</button>
+                <button onclick="alignSelectedFields('top')" title="靠上對齊" class="small">⬆ 靠上</button>
+                <button onclick="alignSelectedFields('centerV')" title="垂直置中" class="small">⬍ 垂直</button>
+                <button onclick="alignSelectedFields('bottom')" title="靠下對齊" class="small">⬇ 靠下</button>
+              </div>
+            </div>
+            <div id="propsEmpty" class="props-empty">點選畫布上的欄位以編輯樣式<br><span class="hint" style="font-size:11px">Shift+點選可多選並對齊</span></div>
             <div id="propsForm" class="props-form" style="display:none">
               <div class="hint">欄位：<b id="propFieldName"></b></div>
-              <label>字級（依原圖解析度計算的像素）</label>
-              <input type="number" id="propFontSize" min="4" max="600">
-              <label>顏色</label>
-              <input type="color" id="propColor">
-              <label>字型</label>
-              <select id="propFontFamily"></select>
-              <label><input type="checkbox" id="propBold" style="width:auto"> 粗體</label>
-              <label>對齊點</label>
-              <select id="propAlign">
-                <option value="center">置中</option>
-                <option value="left">靠左</option>
-                <option value="right">靠右</option>
-              </select>
-              <label>最大寬度（佔畫布寬度 %，超過會自動縮小或換行）</label>
-              <input type="number" id="propMaxWidth" min="5" max="100">
-              <div class="two-col">
-                <div><label>X (%)</label><input type="number" id="propX" step="0.1"></div>
-                <div><label>Y (%)</label><input type="number" id="propY" step="0.1"></div>
+              <div class="two-col" style="margin-top:6px">
+                <div>
+                  <label>類型</label>
+                  <select id="propFieldType">
+                    <option value="text">文字</option>
+                    <option value="image">圖片</option>
+                  </select>
+                </div>
+                <div id="propImgUnitWrap" style="display:none">
+                  <label>單位</label>
+                  <select id="propImgUnit">
+                    <option value="pct">%</option>
+                    <option value="px">px</option>
+                    <option value="cm">cm</option>
+                  </select>
+                </div>
               </div>
-              <div class="two-col" style="margin-top:8px">
-                <button id="btnCenterH" style="flex:1">⬌ 水平置中</button>
-                <button id="btnCenterV" style="flex:1">⬍ 垂直置中</button>
+              <div id="propTextControls">
+                <label>字級（依原圖解析度計算的像素）</label>
+                <input type="number" id="propFontSize" min="4" max="600">
+                <label>顏色</label>
+                <input type="color" id="propColor">
+                <label>字型</label>
+                <select id="propFontFamily"></select>
+                <label><input type="checkbox" id="propBold" style="width:auto"> 粗體</label>
+                <label>最大寬度（佔畫布寬度 %，超過會自動縮小或換行）</label>
+                <input type="number" id="propMaxWidth" min="5" max="100">
+              </div>
+              <div id="propImageControls" style="display:none">
+                <div style="display:flex;gap:6px;align-items:flex-end;margin-top:4px">
+                  <div style="flex:1"><label id="lblImgW">寬</label><input type="number" id="propImgWidth" step="any" min="0.1" style="width:100%"></div>
+                  <div style="flex:1"><label id="lblImgH">高</label><input type="number" id="propImgHeight" step="any" min="0.1" style="width:100%"></div>
+                  <div style="flex:none;padding-bottom:2px">
+                    <button id="btnLockRatio" title="鎖定長寬比" style="padding:6px 8px;font-size:14px;line-height:1">🔓</button>
+                  </div>
+                </div>
+                <p class="hint" style="margin-top:6px">儲存格填入圖片 URL、Drive 分享連結，或在 Sheets 使用「插入→儲存格中的圖片」皆可。<br>cm 單位需在 PDF 頁籤先設定名牌寬高。</p>
+              </div>
+              <div style="border-top:1px solid var(--border);margin-top:10px;padding-top:8px">
+                <div class="two-col">
+                  <div><label>X (%)</label><input type="number" id="propX" step="0.1"></div>
+                  <div><label>Y (%)</label><input type="number" id="propY" step="0.1"></div>
+                </div>
+                <div style="margin-top:6px">
+                  <label>對齊點</label>
+                  <select id="propAlign">
+                    <option value="center">置中</option>
+                    <option value="left">靠左</option>
+                    <option value="right">靠右</option>
+                  </select>
+                </div>
+                <div class="two-col" style="margin-top:6px">
+                  <button id="btnCenterH" style="flex:1">⬌ 水平置中</button>
+                  <button id="btnCenterV" style="flex:1">⬍ 垂直置中</button>
+                </div>
               </div>
               <button class="danger" id="btnRemoveField" style="margin-top:12px;width:100%">移除此欄位</button>
             </div>
@@ -189,6 +267,10 @@
           <div class="row" style="justify-content:space-between">
             <h3 style="margin:0">目前名單</h3>
             <span class="hint checked-count-label">未勾選（預設處理全部名單）</span>
+          </div>
+          <div class="row" style="margin-top:8px;margin-bottom:4px">
+            <input type="text" id="listSearch" placeholder="🔍 搜尋名單…" style="flex:1;min-width:180px">
+            <span id="listSearchCount" class="hint" style="white-space:nowrap"></span>
           </div>
           <p class="hint">勾選左邊的核取方塊可以只針對「這幾筆」產生名牌，不勾則預設處理全部名單。</p>
           <div id="listTableWrap"></div>

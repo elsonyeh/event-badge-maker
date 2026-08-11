@@ -349,6 +349,179 @@ function saveLayout(spreadsheetId, category, layoutArray) {
   return true;
 }
 
+/** 回傳指定類別分頁的標題列（不含系統欄），供複製版面的欄位對應 UI 使用。 */
+function getCategoryHeaders(spreadsheetId, category) {
+  var ss = openSpreadsheet_(spreadsheetId);
+  var sheet = getCategorySheet_(ss, category);
+  return getSheetHeaders_(sheet);
+}
+
+/**
+ * 將來源類別的版面（含背景圖片）複製到目標類別，並套用欄位對應。
+ * fieldMapping: { 來源欄位名: 目標欄位名 | null }，null 表示該欄位不複製。
+ * 回傳 { backgroundCopied }
+ */
+function copyLayoutFull(sourceSpreadsheetId, sourceKey, targetSpreadsheetId, targetKey, fieldMapping) {
+  var sourceSs = openSpreadsheet_(sourceSpreadsheetId);
+  var targetSs = openSpreadsheet_(targetSpreadsheetId);
+  var sourceCat = listCategories_(sourceSs).filter(function (c) { return c.key === sourceKey; })[0];
+  if (!sourceCat) throw new Error('找不到來源類別「' + sourceKey + '」');
+
+  // 套用欄位對應，產生重新命名後的版面
+  var mapping = fieldMapping || {};
+  var remappedLayout = (sourceCat.layout || []).map(function (f) {
+    var mapped = Object.prototype.hasOwnProperty.call(mapping, f.field) ? mapping[f.field] : f.field;
+    if (!mapped) return null; // null 表示「不套用」
+    var copy = JSON.parse(JSON.stringify(f));
+    copy.field = mapped;
+    return copy;
+  }).filter(function (f) { return f !== null; });
+
+  var patch = { layout: remappedLayout };
+  var backgroundCopied = false;
+
+  if (sourceCat.bgFileId) {
+    try {
+      var sourceFile = DriveApp.getFileById(sourceCat.bgFileId);
+      var targetCat = listCategories_(targetSs).filter(function (c) { return c.key === targetKey; })[0];
+      if (targetCat && targetCat.bgFileId) {
+        try { DriveApp.getFileById(targetCat.bgFileId).setTrashed(true); } catch (e) {}
+      }
+      var folder = getOrCreateSubFolder_(targetSs, '名牌背景');
+      var copiedFile = sourceFile.makeCopy(sourceFile.getName(), folder);
+      patch.bgFileId = copiedFile.getId();
+      patch.width = sourceCat.width;
+      patch.height = sourceCat.height;
+      backgroundCopied = true;
+    } catch (e) {
+      // 背景複製失敗不阻斷版面複製
+    }
+  }
+
+  updateCategoryConfig_(targetSs, targetKey, patch);
+  return { backgroundCopied: backgroundCopied };
+}
+
+/**
+ * 讀取指定欄位（圖片欄）的所有列資料，支援三種格式：
+ *   1. 儲存格文字為 URL（含 Drive 分享連結）
+ *   2. =IMAGE("url") 公式
+ *   3. Google Sheets「儲存格中的圖片」（CellImage 物件）
+ * 回傳 { rowIndex: { colName: { base64, mimeType } } }
+ */
+function getRowImageData(spreadsheetId, category, imageColumns) {
+  if (!imageColumns || !imageColumns.length) return {};
+  var ss = openSpreadsheet_(spreadsheetId);
+  var sheet = getCategorySheet_(ss, category);
+  var headers = getSheetHeaders_(sheet);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return {};
+  var result = {};
+  imageColumns.forEach(function (colName) {
+    var colIdx = headers.indexOf(colName) + 1;
+    if (colIdx <= 0) return;
+    var range = sheet.getRange(2, colIdx, lastRow - 1, 1);
+    var values = range.getValues();
+    var formulas = range.getFormulas();
+    for (var i = 0; i < values.length; i++) {
+      var rowIndex = i + 2;
+      var value = values[i][0];
+      var formula = formulas[i][0];
+      var imgData = null;
+      // 1. =IMAGE() 公式
+      if (!imgData && formula) {
+        var m = formula.match(/=IMAGE\s*\(\s*["']([^"']+)["']/i);
+        if (m) imgData = fetchImageAsBase64_(m[1]);
+      }
+      // 2. CellImage 物件（插入→儲存格中的圖片）
+      if (!imgData && value !== null && value !== '' && typeof value === 'object') {
+        try {
+          if (typeof value.getContentUrl === 'function') {
+            var contentUrl = value.getContentUrl();
+            if (contentUrl) imgData = fetchImageAsBase64_(contentUrl);
+          }
+        } catch (e) {}
+      }
+      // 3. URL 字串
+      if (!imgData && typeof value === 'string') {
+        var url = value.trim();
+        if (url.length > 5) imgData = fetchImageAsBase64_(url);
+      }
+      if (imgData) {
+        if (!result[rowIndex]) result[rowIndex] = {};
+        result[rowIndex][colName] = imgData;
+      }
+    }
+  });
+  return result;
+}
+
+/**
+ * 只取第一筆資料列的圖片，供版面編輯器預覽用（輕量版）。
+ * 回傳 { colName: 'data:mimeType;base64,...' }
+ */
+function getPreviewImage(spreadsheetId, category, fieldNames) {
+  if (!fieldNames || !fieldNames.length) return {};
+  var ss = openSpreadsheet_(spreadsheetId);
+  var sheet = getCategorySheet_(ss, category);
+  var headers = getSheetHeaders_(sheet);
+  if (sheet.getLastRow() < 2) return {};
+  var result = {};
+  fieldNames.forEach(function (colName) {
+    var colIdx = headers.indexOf(colName) + 1;
+    if (colIdx <= 0) return;
+    var range = sheet.getRange(2, colIdx, 1, 1);
+    var value = range.getValues()[0][0];
+    var formula = range.getFormulas()[0][0];
+    var imgData = null;
+    if (!imgData && formula) {
+      var m = formula.match(/=IMAGE\s*\(\s*["']([^"']+)["']/i);
+      if (m) imgData = fetchImageAsBase64_(m[1]);
+    }
+    if (!imgData && value !== null && value !== '' && typeof value === 'object') {
+      try {
+        if (typeof value.getContentUrl === 'function') {
+          var u = value.getContentUrl();
+          if (u) imgData = fetchImageAsBase64_(u);
+        }
+      } catch (e) {}
+    }
+    if (!imgData && typeof value === 'string' && value.trim().length > 5) {
+      imgData = fetchImageAsBase64_(value.trim());
+    }
+    if (imgData) result[colName] = 'data:' + imgData.mimeType + ';base64,' + imgData.base64;
+  });
+  return result;
+}
+
+function fetchImageAsBase64_(url) {
+  if (!url || typeof url !== 'string') return null;
+  url = url.trim();
+  try {
+    var blob;
+    // Google Drive 分享連結 /file/d/ID 或 ?id=ID
+    var driveMatch = url.match(/\/file\/d\/([a-zA-Z0-9_-]{10,})/) ||
+                     url.match(/[?&]id=([a-zA-Z0-9_-]{10,})/);
+    if (driveMatch) {
+      blob = DriveApp.getFileById(driveMatch[1]).getBlob();
+    } else {
+      var options = { muteHttpExceptions: true, followRedirects: true };
+      // Google 內部 URL 帶 OAuth Token，避免 403
+      if (url.indexOf('google') !== -1 || url.indexOf('googleusercontent') !== -1) {
+        options.headers = { 'Authorization': 'Bearer ' + ScriptApp.getOAuthToken() };
+      }
+      var resp = UrlFetchApp.fetch(url, options);
+      if (resp.getResponseCode() !== 200) return null;
+      blob = resp.getBlob();
+    }
+    var mimeType = blob.getContentType() || 'image/jpeg';
+    if (!mimeType.startsWith('image/')) return null;
+    return { base64: Utilities.base64Encode(blob.getBytes()), mimeType: mimeType };
+  } catch (e) {
+    return null;
+  }
+}
+
 // ============================================================
 // 名單 (每個類別對應一個分頁)
 // ============================================================
@@ -382,16 +555,30 @@ function getNameList(spreadsheetId, category) {
   var headers = getSheetHeaders_(sheet);
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return { headers: headers, rows: [] };
-  var values = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  var dataRange = sheet.getRange(2, 1, lastRow - 1, headers.length);
+  var values   = dataRange.getValues();
+  var formulas = dataRange.getFormulas();
   var rows = [];
   for (var i = 0; i < values.length; i++) {
     var r = values[i];
-    if (r[0] === '' || r[0] === null) continue; // 以第一欄是否為空判斷是否為空白列
+    if (r[0] === '' || r[0] === null) continue;
     var obj = {};
     for (var h = 0; h < headers.length; h++) {
       var v = r[h];
       if (Object.prototype.toString.call(v) === '[object Date]') {
         v = Utilities.formatDate(v, Session.getScriptTimeZone() || 'Asia/Taipei', 'yyyy-MM-dd HH:mm');
+      } else if (v !== null && typeof v === 'object') {
+        // CellImage：優先從公式抓 URL（=IMAGE("url")），再嘗試 getContentUrl()
+        v = '';
+        var formula = formulas[i][h] || '';
+        var m = formula.match(/=IMAGE\s*\(\s*["']([^"']+)["']/i);
+        if (m) {
+          v = m[1];
+        } else {
+          try {
+            v = (typeof r[h].getContentUrl === 'function') ? (r[h].getContentUrl() || '') : '';
+          } catch (e) {}
+        }
       }
       obj[headers[h]] = v;
     }

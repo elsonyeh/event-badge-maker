@@ -21,13 +21,16 @@ var state = {
   bgNativeW: 0,
   bgNativeH: 0,
   selectedFieldIndex: -1,
+  selectedFieldIndices: [],
   dirtyLayout: false,
   layoutHistory: [],      // 版面編輯的復原/取消復原歷史紀錄（state.layout 的快照陣列）
   layoutHistoryIndex: -1,
   editingRowIndex: null,   // 名單管理表單目前是「新增」還是在編輯某一列
   checkedRows: new Set(),  // 名單管理裡勾選的列（_rowIndex），供「只處理勾選的」與 PDF 匯出範圍使用
+  previewImages: {},       // { fieldName: 'data:...' } 版面編輯器圖片欄位的縮圖（第一列）
   lastGenerated: [],       // [{filename, dataUrl, rowIndex}] 本次瀏覽器工作階段中已產生的名牌，供打包下載
   exportScope: 'all',      // 'all' | 'pending' | 'checked' — 輸出範圍（PNG 與 PDF 共用）
+  listSearch: '',           // 名單搜尋關鍵字
   cancelGeneration: false  // PNG 渲染迴圈的取消旗標
 };
 
@@ -46,16 +49,25 @@ var measureCtx = measureCanvas.getContext('2d');
 // ============================================================
 // google.script.run 包裝成 Promise
 // ============================================================
+var _pendingReqs = 0;
 function runAsync(fnName) {
   var args = Array.prototype.slice.call(arguments, 1);
+  _pendingReqs++;
+  var bar = $('#loadingBar');
+  if (bar) bar.style.display = 'block';
+  function done() {
+    _pendingReqs = Math.max(0, _pendingReqs - 1);
+    if (_pendingReqs === 0) { var b = $('#loadingBar'); if (b) b.style.display = 'none'; }
+  }
   return new Promise(function (resolve, reject) {
     if (!window.google || !google.script || !google.script.run) {
+      done();
       reject(new Error('google.script.run 無法使用（不在 Apps Script 執行環境中）'));
       return;
     }
     google.script.run
-      .withSuccessHandler(resolve)
-      .withFailureHandler(function (err) { reject(new Error(err && err.message ? err.message : String(err))); })[fnName]
+      .withSuccessHandler(function (r) { done(); resolve(r); })
+      .withFailureHandler(function (err) { done(); reject(new Error(err && err.message ? err.message : String(err))); })[fnName]
       .apply(null, args);
   });
 }
@@ -87,6 +99,8 @@ function busy(el, isBusy) { if (el) el.disabled = !!isBusy; }
 // ============================================================
 window.addEventListener('DOMContentLoaded', function () {
   wireStaticEvents();
+  var snapTog = $('#snapToggle'), stage = $('#editorStage');
+  if (snapTog && stage) stage.classList.toggle('snap-on', snapTog.checked);
   boot();
 });
 
@@ -323,6 +337,60 @@ function wireStaticEvents() {
     }).catch(function (err) { toast(err.message, true); });
   });
 
+  function hideCopyPanel() { $('#copyLayoutPanel').style.display = 'none'; }
+
+  $('#btnCopyLayoutCancel').addEventListener('click', hideCopyPanel);
+  $('#btnCopyLayoutCancel2').addEventListener('click', hideCopyPanel);
+
+  $('#btnCopyLayoutBack').addEventListener('click', function () {
+    $('#copyStep2').style.display = 'none';
+    $('#copyStep1').style.display = 'block';
+  });
+
+  // 下一步：抓目標欄位 → 顯示欄位對應 UI
+  $('#btnCopyLayoutNext').addEventListener('click', function () {
+    var targetUid = $('#copyLayoutTarget').value;
+    var sourceUid = $('#copyLayoutPanel').dataset.sourceUid;
+    var source = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === sourceUid; })[0];
+    var target = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === targetUid; })[0];
+    if (!source || !target) return;
+    busy($('#btnCopyLayoutNext'), true);
+    runAsync('getCategoryHeaders', target.spreadsheetId, target.key)
+      .then(function (targetHeaders) {
+        $('#copyLayoutPanel').dataset.targetUid = targetUid;
+        buildFieldMappingUI(source.layout || [], targetHeaders, target.displayName);
+        $('#copyStep1').style.display = 'none';
+        $('#copyStep2').style.display = 'block';
+      })
+      .catch(function (err) { toast(err.message, true); })
+      .finally(function () { busy($('#btnCopyLayoutNext'), false); });
+  });
+
+  // 確認複製：收集對應表 → 呼叫後端
+  $('#btnCopyLayoutConfirm').addEventListener('click', function () {
+    var targetUid = $('#copyLayoutPanel').dataset.targetUid;
+    var sourceUid = $('#copyLayoutPanel').dataset.sourceUid;
+    var source = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === sourceUid; })[0];
+    var target = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === targetUid; })[0];
+    if (!source || !target) return;
+    // 收集 <select> 的對應設定
+    var fieldMapping = {};
+    $all('select[data-source-field]', $('#copyFieldMapping')).forEach(function (sel) {
+      fieldMapping[sel.dataset.sourceField] = sel.value || null;
+    });
+    busy($('#btnCopyLayoutConfirm'), true);
+    runAsync('copyLayoutFull', source.spreadsheetId, source.key, target.spreadsheetId, target.key, fieldMapping)
+      .then(function (result) { return refreshAllConnections().then(function () { return result; }); })
+      .then(function (result) {
+        hideCopyPanel();
+        var bgMsg = result.backgroundCopied ? '（含背景圖片）' : '';
+        toast('已將「' + source.displayName + '」的版面' + bgMsg + '複製到「' + target.displayName + '」');
+        if (state.currentCategory === targetUid) loadLayoutEditor(targetUid);
+      })
+      .catch(function (err) { toast(err.message, true); })
+      .finally(function () { busy($('#btnCopyLayoutConfirm'), false); });
+  });
+
   $('#btnAddCategory').addEventListener('click', function () {
     var targetId = getTargetSpreadsheetId_();
     if (!targetId) { toast('請先連結一份試算表', true); return; }
@@ -357,11 +425,11 @@ function wireStaticEvents() {
   $('#btnDownloadBlankBg').addEventListener('click', downloadBlankBackground);
   $('#bgFileInput').addEventListener('change', handleBgFileChosen);
   $('#btnAutoArrange').addEventListener('click', function () {
-    var added = autoArrangeMissingFields();
-    if (!added) { toast('目前的欄位都已經放置過了'); return; }
+    var count = autoArrangeAllFields();
+    if (!count) { toast('目前沒有可排版的欄位'); return; }
     renderLayoutStage();
     renderFieldTray();
-    toast('已自動排好 ' + added + ' 個欄位的起始位置');
+    toast('已重新排版 ' + count + ' 個欄位');
   });
   $('#btnSaveLayout').addEventListener('click', saveLayoutToServer);
   $('#btnUndoLayout').addEventListener('click', undoLayout);
@@ -369,15 +437,39 @@ function wireStaticEvents() {
   $('#btnCenterH').addEventListener('click', centerSelectedFieldH);
   $('#btnCenterV').addEventListener('click', centerSelectedFieldV);
   $('#btnRemoveField').addEventListener('click', removeSelectedField);
-  ['propFontSize', 'propColor', 'propFontFamily', 'propBold', 'propAlign', 'propMaxWidth', 'propX', 'propY']
+  ['propFontSize', 'propColor', 'propFontFamily', 'propBold', 'propAlign', 'propMaxWidth', 'propX', 'propY', 'propImgWidth', 'propImgHeight']
     .forEach(function (id) {
       var el = $('#' + id);
-      el.addEventListener('input', onPropsChanged); // 即時預覽
-      el.addEventListener('change', pushLayoutHistory); // 值確定變更後才記一筆復原紀錄，避免每個按鍵都記
+      if (!el) return;
+      el.addEventListener('input', onPropsChanged);
+      el.addEventListener('change', pushLayoutHistory);
     });
+  $('#propFieldType').addEventListener('change', onPropsChanged);
+  $('#propImgUnit').addEventListener('change', function () { renderPropsPanel(); });
+  $('#btnLockRatio').addEventListener('click', function () {
+    var idx = state.selectedFieldIndex;
+    if (idx < 0 || !state.layout[idx]) return;
+    var f = state.layout[idx];
+    f._lockRatio = !f._lockRatio;
+    // 鎖定時：widthPct = heightPct（兩者都是「自身的 %」，相等即維持原始比例）
+    if (f._lockRatio) {
+      f.heightPct = f.widthPct || 100;
+      renderLayoutStage();
+      renderPropsPanel();
+    }
+    this.textContent = f._lockRatio ? '🔒' : '🔓';
+  });
+  $('#snapToggle').addEventListener('change', function () {
+    var stage = $('#editorStage');
+    if (stage) stage.classList.toggle('snap-on', this.checked);
+  });
 
   // ---- 名單管理 ----
   $('#listCategorySelect').addEventListener('change', function (e) { selectCategory(e.target.value); });
+  $('#listSearch').addEventListener('input', function () {
+    state.listSearch = this.value.trim().toLowerCase();
+    renderListTable();
+  });
   $('#btnAddEntry').addEventListener('click', submitSingleEntry);
   $('#btnCancelEdit').addEventListener('click', resetAddEntryFormMode);
   $('#btnParseBulk').addEventListener('click', parseBulkPaste);
@@ -445,12 +537,18 @@ function wireStaticEvents() {
 }
 
 function switchTab(tab) {
+  // 離開版面編輯且有未儲存變更時提醒
+  var leavingLayout = tab !== 'layout' &&
+    $all('nav.tabs button[data-tab]').some(function (b) { return b.classList.contains('active') && b.dataset.tab === 'layout'; });
+  if (leavingLayout && state.dirtyLayout) {
+    if (!confirm('版面設定尚未儲存，離開後變更將會遺失，確定要離開嗎？')) return;
+  }
   $all('nav.tabs button[data-tab]').forEach(function (b) { b.classList.toggle('active', b.dataset.tab === tab); });
   $all('.tabpanel').forEach(function (p) { p.classList.toggle('active', p.id === 'tab-' + tab); });
   if (!state.currentCategory) return;
   // 名單/狀態可能在其他頁籤被改動過（例如剛產生完名牌），切換頁籤時重新讀取以避免顯示過期資料。
   // 版面編輯頁籤刻意不自動重新讀取，避免蓋掉使用者尚未儲存的拖曳調整。
-  if (tab === 'layout') requestAnimationFrame(layoutStageResize);
+  if (tab === 'layout') { requestAnimationFrame(layoutStageResize); updateBgInfoDisplay(); }
   else if (tab === 'list') loadNameListTab(state.currentCategory);
   else if (tab === 'generate') loadGenerateTab(state.currentCategory);
 }
@@ -469,11 +567,13 @@ function renderCategoryGrid() {
       var sel = uid === state.currentCategory ? ' selected' : '';
       var bg = c.bgFileId ? '已設定背景' : '尚未上傳背景';
       var sheetTag = multiSheet ? ('<div class="meta">📄 ' + escapeHtml(c.spreadsheetName) + '</div>') : '';
+      var hasLayout = c.layout && c.layout.length > 0;
       return '<div class="cat-card' + sel + '" data-uid="' + escapeHtml(uid) + '">' +
         '<div class="name">' + escapeHtml(c.displayName) + '</div>' +
         '<div class="meta">分頁：' + escapeHtml(c.key) + ' ・ ' + bg + '</div>' + sheetTag +
         '<div class="row" style="margin-top:8px">' +
         '<button class="small" data-rename-uid="' + escapeHtml(uid) + '">✏️ 重新命名</button>' +
+        '<button class="small" data-copy-layout-uid="' + escapeHtml(uid) + '"' + (hasLayout ? '' : ' disabled title="尚未設定版面"') + '>📋 複製版面</button>' +
         '<button class="small danger" data-remove-uid="' + escapeHtml(uid) + '">🗑️ 移除</button>' +
         '</div></div>';
     }).join('');
@@ -506,6 +606,12 @@ function renderCategoryGrid() {
         }).then(function () { toast('已移除類別「' + cat.key + '」'); }).catch(function (err) { toast(err.message, true); });
       });
     });
+    $all('button[data-copy-layout-uid]', grid).forEach(function (btn) {
+      btn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        showCopyLayoutPicker(btn.dataset.copyLayoutUid);
+      });
+    });
   }
   // 同步三個下拉選單
   [['#layoutCategorySelect'], ['#listCategorySelect'], ['#genCategorySelect']].forEach(function (arr) {
@@ -517,6 +623,67 @@ function renderCategoryGrid() {
     }).join('');
     if (state.currentCategory) sel.value = state.currentCategory;
   });
+}
+
+function showCopyLayoutPicker(sourceUid) {
+  var source = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === sourceUid; })[0];
+  if (!source) return;
+  var targets = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) !== sourceUid; });
+  if (!targets.length) { toast('沒有其他類別可以複製到', true); return; }
+  var panel = $('#copyLayoutPanel');
+  panel.dataset.sourceUid = sourceUid;
+  delete panel.dataset.targetUid;
+  $('#copyLayoutLabel').textContent = '將「' + source.displayName + '」的版面複製到：';
+  $('#copyLayoutTarget').innerHTML = targets.map(function (c) {
+    return '<option value="' + escapeHtml(categoryUid(c.spreadsheetId, c.key)) + '">' + escapeHtml(c.displayName) + '</option>';
+  }).join('');
+  // 每次重開都從第一步開始
+  $('#copyStep1').style.display = 'block';
+  $('#copyStep2').style.display = 'none';
+  panel.style.display = 'block';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function buildFieldMappingUI(sourceLayout, targetHeaders, targetDisplayName) {
+  // 只取不重複的欄位名（image 類型的 field 也要對應）
+  var seen = {};
+  var sourceFields = sourceLayout.filter(function (f) {
+    if (!f.field || seen[f.field]) return false;
+    seen[f.field] = true;
+    return true;
+  }).map(function (f) { return f.field; });
+
+  // 系統欄不出現在對應選項裡
+  var SYSTEM = ['產生狀態', '產生時間', '圖片連結'];
+  var availableHeaders = targetHeaders.filter(function (h) { return SYSTEM.indexOf(h) === -1; });
+
+  if (!sourceFields.length) {
+    $('#copyFieldMapping').innerHTML = '<p class="hint">來源版面沒有欄位。</p>';
+    return;
+  }
+
+  var rows = sourceFields.map(function (srcField) {
+    var matched = availableHeaders.indexOf(srcField) !== -1;
+    var options = '<option value="">（不套用）</option>' +
+      availableHeaders.map(function (h) {
+        var sel = h === srcField ? ' selected' : '';
+        return '<option value="' + escapeHtml(h) + '"' + sel + '>' + escapeHtml(h) + '</option>';
+      }).join('');
+    var tag = matched
+      ? '<span style="color:var(--ok);font-size:11px;margin-left:4px">✓ 自動配對</span>'
+      : '<span style="color:var(--text-soft);font-size:11px;margin-left:4px">⚠ 目標無此欄位</span>';
+    return '<tr>' +
+      '<td style="padding:5px 10px 5px 0;white-space:nowrap"><strong>' + escapeHtml(srcField) + '</strong>' + tag + '</td>' +
+      '<td style="padding:5px 0"><select data-source-field="' + escapeHtml(srcField) + '" style="width:100%">' + options + '</select></td>' +
+      '</tr>';
+  }).join('');
+
+  $('#copyFieldMapping').innerHTML =
+    '<table style="width:100%;font-size:13px;border-collapse:collapse">' +
+    '<thead><tr>' +
+    '<th style="text-align:left;padding:4px 10px 4px 0;color:var(--text-soft);font-weight:600;border-bottom:1px solid var(--border)">來源欄位</th>' +
+    '<th style="text-align:left;padding:4px 0;color:var(--text-soft);font-weight:600;border-bottom:1px solid var(--border)">對應到「' + escapeHtml(targetDisplayName) + '」的欄位</th>' +
+    '</tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
 function renderAdoptableSheets() {
@@ -595,10 +762,27 @@ function loadLayoutEditor(uid) {
   $('#layoutBody').style.display = 'block';
   $('#layoutCategorySelect').value = uid;
   state.selectedFieldIndex = -1;
+  state.selectedFieldIndices = [];
+
+  // 立即清空所有與類別相關的狀態，讓使用者立刻看到畫面切換
+  state.bgImageEl = null;
+  state.bgNativeW = 0; state.bgNativeH = 0;
+  state.layout = [];
+  state.headers = [];
+  state.rows = [];
+  state.previewImages = {};
+  renderLayoutStage();
+  renderFieldTray();
+  renderPropsPanel();
+
+  // 顯示畫布 overlay
+  var overlay = $('#stageLoadingOverlay');
+  if (overlay) overlay.style.display = 'flex';
 
   return Promise.all([runAsync('getBackgroundImageData', catRef.spreadsheetId, catRef.key), ensureFontsLoaded()]).then(function (results) {
+    if (state.currentCategory !== uid) return; // 已切換到其他類別，放棄
     var data = results[0];
-    var cat = currentCategoryObj();
+    var cat = state.categories.filter(function (c) { return categoryUid(c.spreadsheetId, c.key) === uid; })[0];
     state.layout = (data && data.layout) || (cat ? cat.layout : []) || [];
     state.dirtyLayout = false;
     state.layoutHistory = [cloneLayout(state.layout)];
@@ -610,20 +794,36 @@ function loadLayoutEditor(uid) {
       state.bgNativeH = data.height;
       var img = new Image();
       img.onload = function () {
+        if (state.currentCategory !== uid) return; // 已切換到其他類別，放棄
         state.bgImageEl = img;
-        $('#bgInfo').textContent = data.width + ' x ' + data.height + ' px';
+        if (overlay) overlay.style.display = 'none';
+        updateBgInfoDisplay();
         renderLayoutStage();
       };
+      img.onerror = function () { if (overlay) overlay.style.display = 'none'; };
       img.src = 'data:' + data.mimeType + ';base64,' + data.base64;
     } else {
       state.bgImageEl = null;
       state.bgNativeW = 0; state.bgNativeH = 0;
-      $('#bgInfo').textContent = '尚未上傳背景圖片';
+      if (overlay) overlay.style.display = 'none';
+      updateBgInfoDisplay();
       renderLayoutStage();
     }
     renderFieldTray();
     renderPropsPanel();
-  }).catch(function (err) { toast(err.message, true); });
+    // 抓第一列的圖片供版面編輯器預覽（包含嵌入型圖片）
+    var imgFields = state.layout.filter(function (f) { return f.type === 'image'; }).map(function (f) { return f.field; });
+    if (imgFields.length) {
+      runAsync('getPreviewImage', catRef.spreadsheetId, catRef.key, imgFields).then(function (previews) {
+        if (state.currentCategory !== uid) return;
+        state.previewImages = previews || {};
+        if (state.bgImageEl) renderLayoutStage();
+      }).catch(function () {});
+    }
+  }).catch(function (err) {
+    if (overlay) overlay.style.display = 'none';
+    toast(err.message, true);
+  });
 }
 
 function handleBgFileChosen(e) {
@@ -683,6 +883,60 @@ function downloadBlankBackground() {
 var STAGE_MAX_W = 560;
 var STAGE_MAX_H = 640;
 
+var SNAP_POSITIONS = [100 / 3, 50, 200 / 3]; // 33.33%, 50%, 66.67%
+var SNAP_THRESHOLD = 4; // % 距離內吸附
+
+function snapPct(v) {
+  var tog = $('#snapToggle');
+  if (!tog || !tog.checked) return Math.round(v * 10) / 10;
+  for (var i = 0; i < SNAP_POSITIONS.length; i++) {
+    if (Math.abs(v - SNAP_POSITIONS[i]) <= SNAP_THRESHOLD) return SNAP_POSITIONS[i];
+  }
+  return Math.round(v * 10) / 10;
+}
+
+function showSnapLines(xPct, yPct) {
+  var tog = $('#snapToggle');
+  if (!tog || !tog.checked) return;
+  $all('.guide-h').forEach(function (el) {
+    var g = parseFloat(el.dataset.guide);
+    el.classList.toggle('snapping', Math.abs(yPct - g) <= SNAP_THRESHOLD);
+  });
+  $all('.guide-v').forEach(function (el) {
+    var g = parseFloat(el.dataset.guide);
+    el.classList.toggle('snapping', Math.abs(xPct - g) <= SNAP_THRESHOLD);
+  });
+}
+
+function hideSnapLines() {
+  $all('.guide-h, .guide-v').forEach(function (el) { el.classList.remove('snapping'); });
+}
+
+function updateBgInfoDisplay() {
+  var el = $('#bgInfo');
+  if (!el) return;
+  var w = state.bgNativeW, h = state.bgNativeH;
+  if (!w || !h) { el.innerHTML = '尚未上傳背景圖片'; return; }
+
+  // 比例（化簡）
+  function gcd(a, b) { return b === 0 ? a : gcd(b, a % b); }
+  var g = gcd(w, h), rw = w / g, rh = h / g;
+  var ratioStr = (rw <= 99 && rh <= 99) ? (rw + ':' + rh) : ((w / h).toFixed(3).replace(/\.?0+$/, '') + ':1');
+
+  // mm（從 PDF 頁籤取得名牌設定，或 badgeOrigW/H）
+  var badgeWmm = (badgeOrigW) || parseFloat($('#pdfBadgeW') && $('#pdfBadgeW').value);
+  var badgeHmm = (badgeOrigH) || parseFloat($('#pdfBadgeH') && $('#pdfBadgeH').value);
+  var mmStr = (badgeWmm && badgeHmm)
+    ? '　' + badgeWmm.toFixed(1) + ' × ' + badgeHmm.toFixed(1) + ' mm'
+    : '';
+
+  el.innerHTML =
+    '<span style="opacity:.6">原始：</span>' +
+    '<span>' + w + ' × ' + h + ' px</span>' +
+    '<span style="margin-left:10px;opacity:.7">比例 ' + ratioStr + '</span>' +
+    (mmStr ? '<span style="margin-left:10px;opacity:.7">' + mmStr + '</span>' : '');
+}
+
 function layoutStageScale() {
   if (!state.bgNativeW || !state.bgNativeH) return 1;
   return Math.min(STAGE_MAX_W / state.bgNativeW, STAGE_MAX_H / state.bgNativeH, 1);
@@ -721,27 +975,95 @@ function sampleValueFor(fieldName) {
 
 function buildFieldBoxEl(field, idx) {
   var el = document.createElement('div');
-  el.className = 'field-box' + (idx === state.selectedFieldIndex ? ' selected' : '');
+  var inSel = state.selectedFieldIndices.indexOf(idx) !== -1;
+  var isAnchor = inSel && state.selectedFieldIndices.length > 1 && idx === state.selectedFieldIndex;
+  el.className = 'field-box' + (inSel ? ' selected' : '') + (isAnchor ? ' multi-anchor' : '');
   el.dataset.idx = idx;
   applyFieldBoxStyleAndText(el, field);
-  el.addEventListener('pointerdown', function (ev) { startDragExistingField(ev, idx); });
+  el.addEventListener('pointerdown', function (ev) {
+    if (ev.shiftKey) { toggleMultiSelectField(ev, idx); }
+    else { startDragExistingField(ev, idx); }
+  });
   return el;
 }
 
 function applyFieldBoxStyleAndText(el, field) {
   var scale = layoutStageScale();
-  var text = sampleValueFor(field.field);
-  var fit = fitText(text, field, state.bgNativeW || 1000);
   el.style.left = field.xPct + '%';
   el.style.top = field.yPct + '%';
-  el.style.color = field.color || '#000000';
-  el.style.fontFamily = field.fontFamily || FONT_CHOICES[0].value;
-  el.style.fontWeight = field.bold ? '700' : '400';
-  el.style.textAlign = field.align || 'center';
-  el.style.fontSize = Math.max(6, fit.fontSize * scale) + 'px';
-  el.innerHTML = fit.lines.map(escapeHtml).join('<br>');
-  var anchorShift = field.align === 'left' ? '0%' : (field.align === 'right' ? '-100%' : '-50%');
-  el.style.transform = 'translate(' + anchorShift + ', -50%)';
+  if (field.type === 'image') {
+    var wPx = Math.round(((field.widthPct || 100) / 100) * (field.natW || state.bgNativeW || 1000) * scale);
+    var hPx = Math.round(((field.heightPct || 100) / 100) * (field.natH || state.bgNativeH || 1000) * scale);
+    el.style.width = wPx + 'px'; el.style.height = hPx + 'px';
+    el.style.display = 'flex'; el.style.flexDirection = 'column';
+    el.style.alignItems = 'center'; el.style.justifyContent = 'center';
+    el.style.background = '';
+    el.style.border = '';
+    el.style.color = 'var(--primary)'; el.style.fontWeight = '400';
+    el.style.fontSize = Math.max(10, Math.min(wPx, hPx) * 0.3) + 'px';
+    el.style.transform = 'translate(-50%,-50%)';
+    var sampleUrl = sampleValueFor(field.field);
+    if (!sampleUrl || !/^https?:\/\//i.test(sampleUrl)) {
+      sampleUrl = (state.previewImages && state.previewImages[field.field]) || '';
+    }
+    el.innerHTML = '';
+    if (sampleUrl) {
+      var previewImg = document.createElement('img');
+      previewImg.src = sampleUrl;
+      previewImg.style.cssText = 'max-width:100%;max-height:100%;object-fit:contain;border-radius:2px';
+      var fallbackSpan = document.createElement('span');
+      fallbackSpan.innerHTML = '📷<span style="font-size:0.6em;display:block">' + escapeHtml(field.field) + '</span>';
+      fallbackSpan.style.display = 'none';
+      previewImg.addEventListener('load', function () {
+        var natW = previewImg.naturalWidth, natH = previewImg.naturalHeight;
+        if (!natW || !natH) return;
+        // 儲存圖片原始尺寸，供渲染與單位換算使用
+        field.natW = natW;
+        field.natH = natH;
+        // widthPct/heightPct 意義：圖片寬高相對自身原始尺寸的百分比（100% = 原始大小）
+        var isDefault = (field.widthPct === 100 && field.heightPct === 100)
+                     || (field.widthPct === 20  && field.heightPct === 20);
+        if (isDefault) {
+          field.widthPct  = 100;
+          field.heightPct = 100;
+          field._lockRatio = true;
+        }
+        var scale = layoutStageScale();
+        el.style.width  = Math.round((field.widthPct  / 100) * natW * scale) + 'px';
+        el.style.height = Math.round((field.heightPct / 100) * natH * scale) + 'px';
+        // 若此欄位正在被選取，同步更新屬性面板
+        if (state.selectedFieldIndex === state.layout.indexOf(field)) {
+          var unit = ($('#propImgUnit') && $('#propImgUnit').value) || 'pct';
+          var wInput = $('#propImgWidth'), hInput = $('#propImgHeight');
+          if (wInput) wInput.value = imgPctToDisplay(field.widthPct,  'W', unit);
+          if (hInput) hInput.value = imgPctToDisplay(field.heightPct, 'H', unit);
+          var lockBtn = $('#btnLockRatio');
+          if (lockBtn) lockBtn.textContent = field._lockRatio ? '🔒' : '🔓';
+        }
+      });
+      previewImg.addEventListener('error', function () {
+        previewImg.style.display = 'none';
+        fallbackSpan.style.display = '';
+      });
+      el.appendChild(previewImg);
+      el.appendChild(fallbackSpan);
+    } else {
+      el.innerHTML = '📷<span style="font-size:0.6em;display:block">' + escapeHtml(field.field) + '</span>';
+    }
+  } else {
+    var text = sampleValueFor(field.field);
+    var fit = fitText(text, field, state.bgNativeW || 1000);
+    el.style.color = field.color || '#000000';
+    el.style.fontFamily = field.fontFamily || FONT_CHOICES[0].value;
+    el.style.fontWeight = field.bold ? '700' : '400';
+    el.style.textAlign = field.align || 'center';
+    el.style.fontSize = Math.max(6, fit.fontSize * scale) + 'px';
+    el.style.width = ''; el.style.height = ''; el.style.background = ''; el.style.border = '';
+    el.style.display = ''; el.style.flexDirection = '';
+    el.innerHTML = fit.lines.map(escapeHtml).join('<br>');
+    var anchorShift = field.align === 'left' ? '0%' : (field.align === 'right' ? '-100%' : '-50%');
+    el.style.transform = 'translate(' + anchorShift + ', -50%)';
+  }
 }
 
 // ---- 從欄位工具列拖曳新增 ----
@@ -773,7 +1095,8 @@ function renderPlacedList() {
     return;
   }
   list.innerHTML = state.layout.map(function (f, idx) {
-    return '<div class="placed-item" data-idx="' + idx + '"><span>' + escapeHtml(f.field) + '</span>' +
+    var label = f.type === 'image' ? ('📷 ' + escapeHtml(f.field)) : escapeHtml(f.field);
+    return '<div class="placed-item" data-idx="' + idx + '"><span>' + label + '</span>' +
       '<button class="small" data-sel="' + idx + '">編輯</button></div>';
   }).join('');
   $all('button[data-sel]', list).forEach(function (btn) {
@@ -781,7 +1104,16 @@ function renderPlacedList() {
   });
 }
 
+function isImageField(fieldName) {
+  if (/圖片|照片|photo|image|img|picture|qrcode/i.test(fieldName)) return true;
+  var sample = (state.rows && state.rows.length) ? String(state.rows[0][fieldName] || '') : '';
+  return /^https?:\/\//i.test(sample);
+}
+
 function defaultFieldConfig(fieldName) {
+  if (isImageField(fieldName)) {
+    return { field: fieldName, type: 'image', xPct: 50, yPct: 50, widthPct: 100, heightPct: 100 };
+  }
   return {
     field: fieldName, xPct: 50, yPct: 50, fontSize: Math.round((state.bgNativeW || 1000) * 0.07),
     fontFamily: FONT_CHOICES[0].value, color: '#000000', bold: false, align: 'center', maxWidthPct: 80
@@ -795,41 +1127,49 @@ function isPrimaryFieldName(name) {
   return s === '姓名' || s === 'name' || s.indexOf('姓名') !== -1 || s.indexOf('name') !== -1;
 }
 
-// 把「還沒被放進版面」的欄位，依它們在標題列裡原本的順序，由上而下平均排進畫布中段
-// （30%~75% 高度，避開背景常見的頁首/頁尾裝飾），當作一個比較通用的起始位置與大小，
-// 使用者接下來只要微調而不用每個欄位都從零開始拖。已經放置過的欄位完全不受影響。
-function autoArrangeMissingFields() {
-  var placedFields = state.layout.map(function (f) { return f.field; });
+// 依標題列順序將所有欄位平均排入畫布中段（30%~75% 高度）。
+// 已放置的欄位保留其字型、顏色等設定，只重置 x/y 位置；未放置的新欄位使用預設值。
+function autoArrangeAllFields() {
   var allFields = (state.headers || []).filter(function (h) {
     return h !== '產生狀態' && h !== '產生時間' && h !== '圖片連結';
   });
-  var missing = allFields.filter(function (h) { return placedFields.indexOf(h) === -1; });
-  if (!missing.length) return 0;
+  if (!allFields.length) return 0;
 
   var n = allFields.length;
   var bandTop = 30, bandBottom = 75;
   var nativeW = state.bgNativeW || 1000;
 
-  missing.forEach(function (field) {
-    var idx = allFields.indexOf(field);
+  var existingMap = {};
+  state.layout.forEach(function (f) { existingMap[f.field] = f; });
+
+  state.layout = allFields.map(function (field, idx) {
     var yPct = n > 1 ? bandTop + ((bandBottom - bandTop) * idx) / (n - 1) : 50;
+    yPct = Math.round(yPct * 10) / 10;
+    if (existingMap[field]) {
+      existingMap[field].xPct = 50;
+      existingMap[field].yPct = yPct;
+      return existingMap[field];
+    }
+    if (isImageField(field)) {
+      return { field: field, type: 'image', xPct: 50, yPct: yPct, widthPct: 100, heightPct: 100 };
+    }
     var primary = isPrimaryFieldName(field);
-    state.layout.push({
+    return {
       field: field,
       xPct: 50,
-      yPct: Math.round(yPct * 10) / 10,
+      yPct: yPct,
       fontSize: Math.round(nativeW * (primary ? 0.12 : 0.06)),
       fontFamily: FONT_CHOICES[0].value,
       color: '#000000',
       bold: primary,
       align: 'center',
       maxWidthPct: 80
-    });
+    };
   });
   state.dirtyLayout = true;
   updateSaveButtonState();
   pushLayoutHistory();
-  return missing.length;
+  return allFields.length;
 }
 
 function startDragNewField(ev, fieldName) {
@@ -854,11 +1194,11 @@ function startDragNewField(ev, fieldName) {
     ghost.remove();
     var rect = stage.getBoundingClientRect();
     if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
-      var xPct = ((e.clientX - rect.left) / rect.width) * 100;
-      var yPct = ((e.clientY - rect.top) / rect.height) * 100;
+      var xPct = snapPct(((e.clientX - rect.left) / rect.width) * 100);
+      var yPct = snapPct(((e.clientY - rect.top) / rect.height) * 100);
       var cfg = defaultFieldConfig(fieldName);
-      cfg.xPct = Math.round(xPct * 10) / 10;
-      cfg.yPct = Math.round(yPct * 10) / 10;
+      cfg.xPct = xPct;
+      cfg.yPct = yPct;
       state.layout.push(cfg);
       state.dirtyLayout = true;
       updateSaveButtonState();
@@ -886,19 +1226,21 @@ function startDragExistingField(ev, idx) {
     if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
     if (!moved) return;
     var rect = stage.getBoundingClientRect();
-    var xPct = Math.min(100, Math.max(0, ((e.clientX - rect.left) / rect.width) * 100));
-    var yPct = Math.min(100, Math.max(0, ((e.clientY - rect.top) / rect.height) * 100));
-    state.layout[idx].xPct = Math.round(xPct * 10) / 10;
-    state.layout[idx].yPct = Math.round(yPct * 10) / 10;
+    var xPct = snapPct(Math.min(100, Math.max(0, ((e.clientX - rect.left) / rect.width) * 100)));
+    var yPct = snapPct(Math.min(100, Math.max(0, ((e.clientY - rect.top) / rect.height) * 100)));
+    state.layout[idx].xPct = xPct;
+    state.layout[idx].yPct = yPct;
     state.dirtyLayout = true;
     updateSaveButtonState();
     var el = $('.field-box[data-idx="' + idx + '"]', stage);
     if (el) applyFieldBoxStyleAndText(el, state.layout[idx]);
     updatePropsPanelPositionOnly();
+    showSnapLines(xPct, yPct);
   }
   function up() {
     document.removeEventListener('pointermove', move);
     document.removeEventListener('pointerup', up);
+    hideSnapLines();
     if (moved) pushLayoutHistory(); // 只有真的拖動過才記錄一筆歷史，單純點選不算
   }
   document.addEventListener('pointermove', move);
@@ -907,8 +1249,92 @@ function startDragExistingField(ev, idx) {
 
 function selectField(idx) {
   state.selectedFieldIndex = idx;
+  state.selectedFieldIndices = idx >= 0 ? [idx] : [];
   renderLayoutStage();
   renderPropsPanel();
+  updateAlignButtonsState();
+}
+
+function toggleMultiSelectField(ev, idx) {
+  ev.preventDefault(); ev.stopPropagation();
+  var arr = state.selectedFieldIndices;
+  var pos = arr.indexOf(idx);
+  if (pos !== -1) { arr.splice(pos, 1); }
+  else { arr.push(idx); state.selectedFieldIndex = idx; }
+  if (arr.length === 1) { state.selectedFieldIndex = arr[0]; }
+  renderLayoutStage();
+  renderPropsPanel();
+  updateAlignButtonsState();
+}
+
+function updateAlignButtonsState() {
+  var panel = $('#multiAlignPanel');
+  if (!panel) return;
+  var count = state.selectedFieldIndices.length;
+  panel.style.display = count >= 2 ? 'block' : 'none';
+  var label = $('#multiAlignCount');
+  if (label) label.textContent = '已選 ' + count + ' 個欄位，Shift+點選可多選';
+}
+
+function getFieldBoundsInPct(idx) {
+  var stage = $('#editorStage');
+  var el = stage && $('.field-box[data-idx="' + idx + '"]', stage);
+  if (!el) return null;
+  var sw = stage.offsetWidth, sh = stage.offsetHeight;
+  if (!sw || !sh) return null;
+  // field-box 以 transform:translate(-50%,-50%) 定位，left/top 是中心點
+  var cx = (el.offsetLeft / sw) * 100;
+  var cy = (el.offsetTop / sh) * 100;
+  var hw = (el.offsetWidth / sw) * 100 / 2;
+  var hh = (el.offsetHeight / sh) * 100 / 2;
+  return { left: cx - hw, right: cx + hw, top: cy - hh, bottom: cy + hh, cx: cx, cy: cy };
+}
+
+function alignSelectedFields(type) {
+  var idxs = state.selectedFieldIndices;
+  if (idxs.length < 2) return;
+  var fields = idxs.map(function (i) { return state.layout[i]; });
+  var bounds = idxs.map(function (i) { return getFieldBoundsInPct(i); });
+  var xs = fields.map(function (f) { return f.xPct; });
+  var ys = fields.map(function (f) { return f.yPct; });
+
+  if (type === 'left') {
+    var minLeft = Math.min.apply(null, bounds.filter(Boolean).map(function (b) { return b.left; }));
+    idxs.forEach(function (i, n) {
+      var b = bounds[n];
+      if (b) state.layout[i].xPct = Math.round((minLeft + (b.cx - b.left)) * 10) / 10;
+    });
+  } else if (type === 'right') {
+    var maxRight = Math.max.apply(null, bounds.filter(Boolean).map(function (b) { return b.right; }));
+    idxs.forEach(function (i, n) {
+      var b = bounds[n];
+      if (b) state.layout[i].xPct = Math.round((maxRight - (b.right - b.cx)) * 10) / 10;
+    });
+  } else if (type === 'top') {
+    var minTop = Math.min.apply(null, bounds.filter(Boolean).map(function (b) { return b.top; }));
+    idxs.forEach(function (i, n) {
+      var b = bounds[n];
+      if (b) state.layout[i].yPct = Math.round((minTop + (b.cy - b.top)) * 10) / 10;
+    });
+  } else if (type === 'bottom') {
+    var maxBottom = Math.max.apply(null, bounds.filter(Boolean).map(function (b) { return b.bottom; }));
+    idxs.forEach(function (i, n) {
+      var b = bounds[n];
+      if (b) state.layout[i].yPct = Math.round((maxBottom - (b.bottom - b.cy)) * 10) / 10;
+    });
+  } else if (type === 'centerH') {
+    var val = xs.reduce(function (a, b) { return a + b; }, 0) / xs.length;
+    fields.forEach(function (f) { f.xPct = Math.round(val * 10) / 10; });
+  } else if (type === 'centerV') {
+    var valV = ys.reduce(function (a, b) { return a + b; }, 0) / ys.length;
+    fields.forEach(function (f) { f.yPct = Math.round(valV * 10) / 10; });
+  }
+
+  state.dirtyLayout = true;
+  updateSaveButtonState();
+  renderLayoutStage();
+  renderPropsPanel();
+  pushLayoutHistory();
 }
 
 function renderPropsPanel() {
@@ -923,18 +1349,35 @@ function renderPropsPanel() {
   form.style.display = 'block';
   empty.style.display = 'none';
   var f = state.layout[idx];
+  var isImage = f.type === 'image';
   $('#propFieldName').textContent = f.field;
-  $('#propFontSize').value = f.fontSize;
-  $('#propColor').value = f.color || '#000000';
-  var famSel = $('#propFontFamily');
-  if (!famSel.dataset.filled) {
-    famSel.innerHTML = FONT_CHOICES.map(function (fc) { return '<option value="' + fc.value + '">' + fc.label + '</option>'; }).join('');
-    famSel.dataset.filled = '1';
+  $('#propFieldType').value = isImage ? 'image' : 'text';
+  $('#propTextControls').style.display = isImage ? 'none' : 'block';
+  $('#propImageControls').style.display = isImage ? 'block' : 'none';
+  var imgUnitWrap = $('#propImgUnitWrap');
+  if (imgUnitWrap) imgUnitWrap.style.display = isImage ? 'block' : 'none';
+  if (isImage) {
+    var unit = ($('#propImgUnit') && $('#propImgUnit').value) || 'pct';
+    var unitLabel = unit === 'px' ? 'px' : unit === 'cm' ? 'cm' : '%';
+    $('#lblImgW').textContent = '寬 (' + unitLabel + ')';
+    $('#lblImgH').textContent = '高 (' + unitLabel + ')';
+    $('#propImgWidth').value = imgPctToDisplay(f.widthPct || 100, 'W', unit);
+    $('#propImgHeight').value = imgPctToDisplay(f.heightPct || 100, 'H', unit);
+    var lockBtn = $('#btnLockRatio');
+    if (lockBtn) lockBtn.textContent = f._lockRatio ? '🔒' : '🔓';
+  } else {
+    $('#propFontSize').value = f.fontSize;
+    $('#propColor').value = f.color || '#000000';
+    var famSel = $('#propFontFamily');
+    if (!famSel.dataset.filled) {
+      famSel.innerHTML = FONT_CHOICES.map(function (fc) { return '<option value="' + fc.value + '">' + fc.label + '</option>'; }).join('');
+      famSel.dataset.filled = '1';
+    }
+    famSel.value = f.fontFamily || FONT_CHOICES[0].value;
+    $('#propBold').checked = !!f.bold;
+    $('#propAlign').value = f.align || 'center';
+    $('#propMaxWidth').value = f.maxWidthPct;
   }
-  famSel.value = f.fontFamily || FONT_CHOICES[0].value;
-  $('#propBold').checked = !!f.bold;
-  $('#propAlign').value = f.align || 'center';
-  $('#propMaxWidth').value = f.maxWidthPct;
   $('#propX').value = f.xPct;
   $('#propY').value = f.yPct;
 }
@@ -950,12 +1393,43 @@ function onPropsChanged() {
   var idx = state.selectedFieldIndex;
   if (idx < 0 || !state.layout[idx]) return;
   var f = state.layout[idx];
-  f.fontSize = parseFloat($('#propFontSize').value) || f.fontSize;
-  f.color = $('#propColor').value;
-  f.fontFamily = $('#propFontFamily').value;
-  f.bold = $('#propBold').checked;
-  f.align = $('#propAlign').value;
-  f.maxWidthPct = parseFloat($('#propMaxWidth').value) || f.maxWidthPct;
+  var newType = $('#propFieldType').value || 'text';
+  if (newType !== (f.type || 'text')) {
+    f.type = newType;
+    if (newType === 'image') {
+      f.widthPct  = f.widthPct  || 100;
+      f.heightPct = f.heightPct || 100;
+    }
+    renderPropsPanel();
+  }
+  if (f.type === 'image') {
+    var unit = ($('#propImgUnit') && $('#propImgUnit').value) || 'pct';
+    var newW = imgDisplayToPct(parseFloat($('#propImgWidth').value) || 0, 'W', unit);
+    var newH = imgDisplayToPct(parseFloat($('#propImgHeight').value) || 0, 'H', unit);
+    if (f._lockRatio && newW && newW !== f.widthPct) {
+      // 鎖比例：寬改動 → 高跟著改（widthPct=heightPct 即維持自身原始比例）
+      f.widthPct = newW;
+      f.heightPct = newW;
+      var hInput = $('#propImgHeight');
+      if (hInput) hInput.value = imgPctToDisplay(f.heightPct, 'H', unit);
+    } else if (f._lockRatio && newH && newH !== f.heightPct) {
+      // 鎖比例：高改動 → 寬跟著改
+      f.heightPct = newH;
+      f.widthPct = newH;
+      var wInput = $('#propImgWidth');
+      if (wInput) wInput.value = imgPctToDisplay(f.widthPct, 'W', unit);
+    } else {
+      f.widthPct  = newW || f.widthPct  || 100;
+      f.heightPct = newH || f.heightPct || 100;
+    }
+  } else {
+    f.fontSize = parseFloat($('#propFontSize').value) || f.fontSize;
+    f.color = $('#propColor').value;
+    f.fontFamily = $('#propFontFamily').value;
+    f.bold = $('#propBold').checked;
+    f.align = $('#propAlign').value;
+    f.maxWidthPct = parseFloat($('#propMaxWidth').value) || f.maxWidthPct;
+  }
   f.xPct = parseFloat($('#propX').value);
   f.yPct = parseFloat($('#propY').value);
   state.dirtyLayout = true;
@@ -970,6 +1444,7 @@ function removeSelectedField() {
   if (idx < 0) return;
   state.layout.splice(idx, 1);
   state.selectedFieldIndex = -1;
+  state.selectedFieldIndices = [];
   state.dirtyLayout = true;
   updateSaveButtonState();
   renderLayoutStage();
@@ -1006,6 +1481,7 @@ function pushLayoutHistory() {
 function restoreLayoutFromHistory() {
   state.layout = cloneLayout(state.layoutHistory[state.layoutHistoryIndex]);
   state.selectedFieldIndex = -1;
+  state.selectedFieldIndices = [];
   state.dirtyLayout = true;
   updateSaveButtonState();
   renderLayoutStage();
@@ -1120,13 +1596,32 @@ function loadNameListTab(uid) {
   $('#listBody').style.display = 'block';
   $('#listCategorySelect').value = uid;
   runAsync('getNameList', catRef.spreadsheetId, catRef.key).then(function (data) {
+    if (state.currentCategory !== uid) return;
     state.headers = data.headers;
     state.rows = data.rows;
-    state.checkedRows = new Set(); // 名單重新讀取後，列號可能不再對應原本勾的那些人，重置勾選
+    state.checkedRows = new Set();
     renderAddEntryForm();
-    resetAddEntryFormMode(); // 換分頁一律回到「新增」模式，避免把上一個類別編輯到一半的列送錯分頁
+    resetAddEntryFormMode();
     renderListTable();
     updateCheckedCountUI();
+    // 有了名單資料後，把版面裡尚未標記為 image 的欄位重新偵測一次
+    var layoutChanged = false;
+    state.layout.forEach(function (f) {
+      if (f.type !== 'image' && isImageField(f.field)) {
+        f.type = 'image';
+        if (!f.widthPct)  f.widthPct  = 100;
+        if (!f.heightPct) f.heightPct = 100;
+        layoutChanged = true;
+      }
+    });
+    if (layoutChanged) {
+      state.dirtyLayout = true;
+      updateSaveButtonState();
+    }
+    // headers 更新後，重繪欄位匣（可用欄位清單現在才是正確的）
+    renderFieldTray();
+    // 若版面編輯器背景已載入完畢，重新渲染畫布讓圖片欄位顯示縮圖
+    if (state.bgImageEl) renderLayoutStage();
   }).catch(function (err) { toast(err.message, true); });
 }
 
@@ -1169,10 +1664,18 @@ function renderListTable() {
   var wrap = $('#listTableWrap');
   var catRef = currentCategoryObj();
   var displayHeaders = state.headers.filter(function (h) { return h !== '圖片連結'; });
-  var allChecked = state.rows.length > 0 && state.rows.every(function (r) { return state.checkedRows.has(r._rowIndex); });
+  var q = state.listSearch || '';
+  var visibleRows = q ? state.rows.filter(function (r) {
+    return displayHeaders.some(function (h) {
+      return String(r[h] || '').toLowerCase().indexOf(q) !== -1;
+    });
+  }) : state.rows;
+  var countEl = $('#listSearchCount');
+  if (countEl) countEl.textContent = q ? ('共 ' + visibleRows.length + ' / ' + state.rows.length + ' 筆') : '';
+  var allChecked = visibleRows.length > 0 && visibleRows.every(function (r) { return state.checkedRows.has(r._rowIndex); });
   var thead = '<tr><th><input type="checkbox" id="checkAllRows"' + (allChecked ? ' checked' : '') + '></th>' +
     displayHeaders.map(function (h) { return '<th>' + escapeHtml(h) + '</th>'; }).join('') + '<th>操作</th></tr>';
-  var tbody = state.rows.map(function (r) {
+  var tbody = visibleRows.map(function (r) {
     var checked = state.checkedRows.has(r._rowIndex) ? ' checked' : '';
     var tds = '<td><input type="checkbox" class="row-check" data-row="' + r._rowIndex + '"' + checked + '></td>' +
       displayHeaders.map(function (h) {
@@ -1188,13 +1691,14 @@ function renderListTable() {
       '</td>';
     return '<tr>' + tds + actions + '</tr>';
   }).join('');
+  var emptyMsg = q ? '找不到符合「' + escapeHtml(q) + '」的名單。' : '目前還沒有名單，請在下方新增。';
   wrap.innerHTML = '<div class="table-scroll"><table><thead>' + thead + '</thead><tbody>' +
-    (tbody || '<tr><td colspan="' + (displayHeaders.length + 2) + '" class="hint" style="padding:16px;">目前還沒有名單，請在下方新增。</td></tr>') +
+    (tbody || '<tr><td colspan="' + (displayHeaders.length + 2) + '" class="hint" style="padding:16px;">' + emptyMsg + '</td></tr>') +
     '</tbody></table></div>';
 
   $('#checkAllRows').addEventListener('change', function () {
     var checked = $('#checkAllRows').checked;
-    state.rows.forEach(function (r) {
+    visibleRows.forEach(function (r) {
       if (checked) state.checkedRows.add(r._rowIndex); else state.checkedRows.delete(r._rowIndex);
     });
     renderListTable();
@@ -1367,6 +1871,19 @@ function confirmBulkImport() {
   if (!parsed.length) return;
   var catRef = currentCategoryObj();
   if (!catRef) return;
+  // 重複偵測：比對待匯入資料與現有名單
+  var systemFields = new Set(['產生狀態', '產生時間', '圖片連結', '_rowIndex']);
+  var dataFields = state.headers.filter(function (h) { return !systemFields.has(h); });
+  var rowKey = function (r) { return dataFields.map(function (h) { return String(r[h] || '').trim(); }).join('\x00'); };
+  var existingKeys = new Set(state.rows.map(rowKey));
+  var dupNames = parsed.filter(function (r) { return existingKeys.has(rowKey(r)); })
+    .map(function (r) { return r[dataFields[0]] || '（空白）'; });
+  if (dupNames.length) {
+    var msg = '偵測到 ' + dupNames.length + ' 筆資料與現有名單重複：\n' +
+      dupNames.slice(0, 10).join('、') + (dupNames.length > 10 ? '…等' : '') +
+      '\n\n要繼續匯入（含重複）嗎？';
+    if (!confirm(msg)) return;
+  }
   busy($('#btnConfirmBulk'), true);
   runAsync('addNameEntriesBulk', catRef.spreadsheetId, catRef.key, parsed).then(function (data) {
     state.rows = data.rows; state.headers = data.headers;
@@ -1440,7 +1957,76 @@ function loadImageFromBase64(base64, mimeType) {
   });
 }
 
-function renderBadgeCanvas(bgImg, nativeW, nativeH, layout, rowData, outputScale) {
+function imgPctToDisplay(pct, dim, unit) {
+  // pct 是「自身的 %」：100% = 圖片原始尺寸
+  if (unit === 'px') {
+    var f = state.layout && state.layout[state.selectedFieldIndex];
+    var natPx = dim === 'W' ? (f && f.natW || state.bgNativeW || 1000)
+                            : (f && f.natH || state.bgNativeH || 1000);
+    return Math.round(pct / 100 * natPx);
+  }
+  if (unit === 'cm') {
+    var f = state.layout && state.layout[state.selectedFieldIndex];
+    var natPx  = dim === 'W' ? (f && f.natW || state.bgNativeW || 1000)
+                             : (f && f.natH || state.bgNativeH || 1000);
+    var bgPx   = dim === 'W' ? (state.bgNativeW || 1000) : (state.bgNativeH || 1000);
+    var badgeMm = dim === 'W' ? parseFloat($('#pdfBadgeW').value)
+                              : parseFloat($('#pdfBadgeH').value);
+    if (!badgeMm) return Math.round(pct * 10) / 10;
+    return Math.round(pct / 100 * natPx / bgPx * badgeMm / 10 * 100) / 100;
+  }
+  return Math.round(pct * 10) / 10;
+}
+
+function imgDisplayToPct(val, dim, unit) {
+  if (unit === 'px') {
+    var f = state.layout && state.layout[state.selectedFieldIndex];
+    var natPx = dim === 'W' ? (f && f.natW || state.bgNativeW || 1000)
+                            : (f && f.natH || state.bgNativeH || 1000);
+    return val / natPx * 100;
+  }
+  if (unit === 'cm') {
+    var f = state.layout && state.layout[state.selectedFieldIndex];
+    var natPx  = dim === 'W' ? (f && f.natW || state.bgNativeW || 1000)
+                             : (f && f.natH || state.bgNativeH || 1000);
+    var bgPx   = dim === 'W' ? (state.bgNativeW || 1000) : (state.bgNativeH || 1000);
+    var badgeMm = dim === 'W' ? parseFloat($('#pdfBadgeW').value)
+                              : parseFloat($('#pdfBadgeH').value);
+    if (!badgeMm) return val;
+    return val * 10 / badgeMm * bgPx / natPx * 100;
+  }
+  return val;
+}
+
+function getImageColumns(layout) {
+  var seen = {};
+  return (layout || []).filter(function (f) {
+    if (f.type !== 'image') return false;
+    if (seen[f.field]) return false;
+    seen[f.field] = true;
+    return true;
+  }).map(function (f) { return f.field; });
+}
+
+function preloadRowImages(imageData) {
+  var promises = [];
+  var result = {};
+  Object.keys(imageData || {}).forEach(function (rowIndex) {
+    var cols = imageData[rowIndex];
+    Object.keys(cols).forEach(function (colName) {
+      var d = cols[colName];
+      if (!d) return;
+      var p = loadImageFromBase64(d.base64, d.mimeType).then(function (img) {
+        if (!result[rowIndex]) result[rowIndex] = {};
+        result[rowIndex][colName] = img;
+      }).catch(function () {});
+      promises.push(p);
+    });
+  });
+  return Promise.all(promises).then(function () { return result; });
+}
+
+function renderBadgeCanvas(bgImg, nativeW, nativeH, layout, rowData, outputScale, rowImages) {
   // outputScale 預設 1（實際輸出解析度=原圖解析度）。PDF 匯出時每張名牌在紙上通常只有幾公分，
   // 用不到原圖全解析度，會傳一個 <1 的縮放比例，改用較小的畫布省記憶體與 PDF 檔案大小；
   // 版面座標／字級全部還是照 nativeW/nativeH 算，靠 ctx.scale() 統一縮放，比例不會跑掉。
@@ -1455,6 +2041,14 @@ function renderBadgeCanvas(bgImg, nativeW, nativeH, layout, rowData, outputScale
   ctx.drawImage(bgImg, 0, 0, nativeW, nativeH);
   layout.forEach(function (field) {
     var text = rowData[field.field];
+    if (field.type === 'image') {
+      var img = rowImages && rowImages[field.field];
+      if (!img) return;
+      var iw = ((field.widthPct || 100) / 100) * (field.natW || img.naturalWidth || nativeW);
+      var ih = ((field.heightPct || 100) / 100) * (field.natH || img.naturalHeight || nativeH);
+      ctx.drawImage(img, (field.xPct / 100) * nativeW - iw / 2, (field.yPct / 100) * nativeH - ih / 2, iw, ih);
+      return;
+    }
     if (text === undefined || text === null || text === '') return;
     var fit = fitText(text, field, nativeW);
     ctx.font = (field.bold ? 'bold ' : '') + fit.fontSize + 'px ' + field.fontFamily;
@@ -1512,8 +2106,12 @@ function generateBadges() {
         return null;
       }
 
-      return loadImageFromBase64(bgData.base64, bgData.mimeType).then(function (img) {
-        return runGenerationLoop(catRef, rows, img, bgData.width, bgData.height, bgData.layout);
+      var imgCols = getImageColumns(bgData.layout);
+      var imagesPromise = imgCols.length
+        ? runAsync('getRowImageData', catRef.spreadsheetId, catRef.key, imgCols).then(preloadRowImages)
+        : Promise.resolve({});
+      return Promise.all([loadImageFromBase64(bgData.base64, bgData.mimeType), imagesPromise]).then(function (r) {
+        return runGenerationLoop(catRef, rows, r[0], bgData.width, bgData.height, bgData.layout, r[1]);
       });
     })
     .then(function (result) {
@@ -1541,7 +2139,7 @@ function generateBadges() {
     });
 }
 
-function runGenerationLoop(catRef, rows, bgImg, w, h, layout) {
+function runGenerationLoop(catRef, rows, bgImg, w, h, layout, preloadedImages) {
   var progressWrap = $('#progressWrap');
   var bar = $('#progressBar');
   var label = $('#progressLabel');
@@ -1565,7 +2163,7 @@ function runGenerationLoop(catRef, rows, bgImg, w, h, layout) {
     bar.style.width = Math.round((i / rows.length) * 100) + '%';
     label.textContent = '渲染中… (' + (i + 1) + ' / ' + rows.length + ') ' + (row['姓名'] || '');
 
-    var canvas = renderBadgeCanvas(bgImg, w, h, layout, row);
+    var canvas = renderBadgeCanvas(bgImg, w, h, layout, row, 1, (preloadedImages || {})[row._rowIndex] || {});
     var dataUrl = canvas.toDataURL('image/png');
     var filename = buildBadgeFilename(catRef.key, row);
     state.lastGenerated.push({ filename: filename, dataUrl: dataUrl, rowIndex: row._rowIndex });
@@ -1806,8 +2404,12 @@ function exportPdf() {
       // 旋轉後的畫布寬對應的是原圖的高（nativeH），需用對應維度算縮放比
       var outputScale = firstSlot.rotate ? (targetPxW / bgData.height) : (targetPxW / bgData.width);
 
-      return loadImageFromBase64(bgData.base64, bgData.mimeType).then(function (img) {
-        return runPdfExportLoop(catRef, allRows, img, bgData.width, bgData.height, bgData.layout, pageSize, slots, outputScale, blankCount);
+      var pdfImgCols = getImageColumns(bgData.layout);
+      var pdfImagesPromise = pdfImgCols.length
+        ? runAsync('getRowImageData', catRef.spreadsheetId, catRef.key, pdfImgCols).then(preloadRowImages)
+        : Promise.resolve({});
+      return Promise.all([loadImageFromBase64(bgData.base64, bgData.mimeType), pdfImagesPromise]).then(function (pr) {
+        return runPdfExportLoop(catRef, allRows, pr[0], bgData.width, bgData.height, bgData.layout, pageSize, slots, outputScale, blankCount, pr[1]);
       }).then(function (loopResult) {
         var filename = sanitizeFilename(catRef.key) + '_名牌.pdf';
         loopResult.pdf.save(filename);
@@ -1838,7 +2440,7 @@ function exportPdf() {
     });
 }
 
-function runPdfExportLoop(catRef, rows, bgImg, w, h, layout, pageSize, slots, outputScale, blankCount) {
+function runPdfExportLoop(catRef, rows, bgImg, w, h, layout, pageSize, slots, outputScale, blankCount, preloadedImages) {
   var progressWrap = $('#pdfProgressWrap');
   var bar = $('#pdfProgressBar');
   var label = $('#pdfProgressLabel');
@@ -1866,7 +2468,8 @@ function runPdfExportLoop(catRef, rows, bgImg, w, h, layout, pageSize, slots, ou
     var slot = slots[slotIdx];
 
     // 空白名牌傳空物件，renderBadgeCanvas 會跳過所有欄位只保留背景
-    var canvas = renderBadgeCanvas(bgImg, w, h, layout, isBlank ? {} : row, outputScale);
+    var rowImgs = isBlank ? {} : ((preloadedImages || {})[row._rowIndex] || {});
+    var canvas = renderBadgeCanvas(bgImg, w, h, layout, isBlank ? {} : row, outputScale, rowImgs);
     if (slot.rotate) canvas = rotateCanvas90(canvas);
     var dataUrl = canvas.toDataURL('image/jpeg', 0.92);
     pdf.addImage(dataUrl, 'JPEG', slot.x, slot.y, slot.w, slot.h);
@@ -1899,56 +2502,44 @@ function markPdfPreviewStale() {
   if (stale) stale.style.display = 'inline';
 }
 
-function drawPdfPagePreview(pageW, pageH, margin, slots) {
+function drawPdfFirstPagePreview(pageW, pageH, margin, slots, bgImg, bgW, bgH, layout, rows, blankCount, preloadedImages) {
   var canvas = $('#pdfLayoutCanvas');
-  var maxW = 240, maxH = 340;
-  var scale = Math.min(maxW / pageW, maxH / pageH);
-  canvas.width = Math.round(pageW * scale);
-  canvas.height = Math.round(pageH * scale);
+  var maxW = 360, maxH = 480;
+  var ps = Math.min(maxW / pageW, maxH / pageH);
+  canvas.width = Math.round(pageW * ps);
+  canvas.height = Math.round(pageH * ps);
   var ctx = canvas.getContext('2d');
 
-  // 紙張底色
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   // 邊界虛線
   ctx.setLineDash([3, 3]);
-  ctx.strokeStyle = '#94a3b8';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(margin * scale, margin * scale,
-    (pageW - 2 * margin) * scale, (pageH - 2 * margin) * scale);
+  ctx.strokeStyle = '#cbd5e1';
+  ctx.lineWidth = 0.5;
+  ctx.strokeRect(margin * ps, margin * ps, (pageW - 2 * margin) * ps, (pageH - 2 * margin) * ps);
   ctx.setLineDash([]);
 
-  // 名牌格子
+  var total = rows.length + blankCount;
   slots.forEach(function (slot, i) {
-    var sx = slot.x * scale, sy = slot.y * scale, sw = slot.w * scale, sh = slot.h * scale;
-    var hue = (i * 51 + 195) % 360;
-    ctx.fillStyle = 'hsla(' + hue + ',65%,80%,.55)';
-    ctx.fillRect(sx, sy, sw, sh);
-    ctx.strokeStyle = 'hsl(' + hue + ',60%,40%)';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(sx + .5, sy + .5, sw - 1, sh - 1);
-    // 對角線（旋轉後方向改變，可目視確認）
-    ctx.strokeStyle = 'hsl(' + hue + ',50%,35%)';
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx + sw, sy + sh); ctx.stroke();
-    // 左上角紅點（原始頂點，旋轉後應跑到左下角）
-    ctx.fillStyle = '#e11d48';
-    ctx.beginPath();
-    ctx.arc(sx + 3, sy + 3, Math.max(2, Math.min(4, sw * 0.07)), 0, Math.PI * 2);
-    ctx.fill();
-    // 格子編號
-    ctx.fillStyle = 'hsl(' + hue + ',60%,20%)';
-    var fs = Math.max(7, Math.min(12, sh * 0.22));
-    ctx.font = 'bold ' + fs + 'px Arial';
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(i + 1, sx + sw / 2, sy + sh / 2);
+    if (i >= total) return;
+    var rowData = i < rows.length ? rows[i] : {};
+    var slotPxW = slot.w * ps;
+    var slotPxH = slot.h * ps;
+    var outputScale = slotPxW / (slot.rotate ? bgH : bgW);
+    var rowImgs = rowData._rowIndex ? ((preloadedImages || {})[rowData._rowIndex] || {}) : {};
+    var badgeCanvas = renderBadgeCanvas(bgImg, bgW, bgH, layout, rowData, outputScale, rowImgs);
+    var sx = slot.x * ps, sy = slot.y * ps;
+    if (slot.rotate) {
+      ctx.drawImage(rotateCanvas90(badgeCanvas), sx, sy, slotPxW, slotPxH);
+    } else {
+      ctx.drawImage(badgeCanvas, sx, sy, slotPxW, slotPxH);
+    }
   });
 
-  // 紙張外框
   ctx.strokeStyle = '#64748b';
   ctx.lineWidth = 1;
-  ctx.strokeRect(.5, .5, canvas.width - 1, canvas.height - 1);
+  ctx.strokeRect(0.5, 0.5, canvas.width - 1, canvas.height - 1);
 }
 
 function previewPdfLayout() {
@@ -1978,15 +2569,10 @@ function previewPdfLayout() {
     var slots = computeBadgeGrid(pageSize.w, pageSize.h, margin, gap, badgeW, badgeH, bgData.width / bgData.height);
     var firstSlot = slots[0];
     var rotate = firstSlot.rotate;
-    var targetPxW = (firstSlot.w / 25.4) * PDF_TARGET_DPI;
-    var outputScale = rotate ? (targetPxW / bgData.height) : (targetPxW / bgData.width);
 
     // 顯示預覽區
     $('#pdfPreviewSection').style.display = 'block';
     $('#pdfPreviewStale').style.display = 'none';
-
-    // 繪製頁面格子
-    drawPdfPagePreview(pageSize.w, pageSize.h, margin, slots);
 
     // 統計資訊
     var rowsData = getRowsByScope(listData.rows);
@@ -2001,6 +2587,17 @@ function previewPdfLayout() {
       '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">預計頁數</td><td><strong>' + totalPages + ' 頁</strong></td></tr>' +
       '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">紙張</td><td><strong>' + pageSize.w + '&times;' + pageSize.h + ' mm</strong></td></tr>' +
       '</table>';
+
+    // 實際渲染第一頁預覽
+    var layout = bgData.layout && bgData.layout.length ? bgData.layout : state.layout;
+    var previewImgCols = getImageColumns(layout);
+    var previewRows = rowsData.slice(0, slots.length); // 只取第一頁用到的列
+    var previewImagesPromise = previewImgCols.length
+      ? runAsync('getRowImageData', catRef.spreadsheetId, catRef.key, previewImgCols).then(preloadRowImages)
+      : Promise.resolve({});
+    return Promise.all([loadImageFromBase64(bgData.base64, bgData.mimeType), previewImagesPromise]).then(function (pr) {
+      drawPdfFirstPagePreview(pageSize.w, pageSize.h, margin, slots, pr[0], bgData.width, bgData.height, layout, previewRows, blankCount, pr[1]);
+    });
 
   }).catch(function (err) { toast(err.message, true); })
     .finally(function () { busy($('#btnPreviewPdf'), false); });
