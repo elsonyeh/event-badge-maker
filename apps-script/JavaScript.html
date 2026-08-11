@@ -1005,6 +1005,8 @@ function applyFieldBoxStyleAndText(el, field) {
     if (!sampleUrl || !/^https?:\/\//i.test(sampleUrl)) {
       sampleUrl = (state.previewImages && state.previewImages[field.field]) || '';
     }
+    var existingImg = el.querySelector('img');
+    if (existingImg && sampleUrl && existingImg.src === sampleUrl) { return; }
     el.innerHTML = '';
     if (sampleUrl) {
       var previewImg = document.createElement('img');
@@ -1381,7 +1383,8 @@ function onPropsChanged() {
   if (idx < 0 || !state.layout[idx]) return;
   var f = state.layout[idx];
   var newType = $('#propFieldType').value || 'text';
-  if (newType !== (f.type || 'text')) {
+  var typeChanged = newType !== (f.type || 'text');
+  if (typeChanged) {
     f.type = newType;
     if (newType === 'image') {
       f.widthPct   = f.widthPct   || 100;
@@ -1420,9 +1423,14 @@ function onPropsChanged() {
   f.yPct = parseFloat($('#propY').value);
   state.dirtyLayout = true;
   updateSaveButtonState();
+  if (!typeChanged) {
+    var stage = $('#editorStage');
+    var existingEl = stage && $('.field-box[data-idx="' + idx + '"]', stage);
+    if (existingEl) { applyFieldBoxStyleAndText(existingEl, f); existingEl.classList.add('selected'); return; }
+  }
   renderLayoutStage();
-  var el = $('.field-box[data-idx="' + idx + '"]');
-  if (el) el.classList.add('selected');
+  var selEl = $('.field-box[data-idx="' + idx + '"]');
+  if (selEl) selEl.classList.add('selected');
 }
 
 function removeSelectedField() {
