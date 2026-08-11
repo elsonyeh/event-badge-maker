@@ -2,5 +2,7 @@
 .DS_Store
 Thumbs.db
 
-# 假資料（測試用）
-假資料.csv
+# 假資料與測試資料（不進版控）
+假資料*.csv
+假資料*.xlsx
+sample-data/
