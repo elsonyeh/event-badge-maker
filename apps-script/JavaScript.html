@@ -1006,12 +1006,16 @@ function applyFieldBoxStyleAndText(el, field) {
       sampleUrl = (state.previewImages && state.previewImages[field.field]) || '';
     }
     var existingImg = el.querySelector('img');
-    if (existingImg && sampleUrl && existingImg.src === sampleUrl) { return; }
+    if (existingImg && sampleUrl && existingImg.src === sampleUrl) {
+      existingImg.style.width  = wPx + 'px';
+      existingImg.style.height = hPx + 'px';
+      return;
+    }
     el.innerHTML = '';
     if (sampleUrl) {
       var previewImg = document.createElement('img');
       previewImg.src = sampleUrl;
-      previewImg.style.cssText = 'width:100%;height:100%;object-fit:fill;border-radius:2px';
+      previewImg.style.cssText = 'display:block;object-fit:fill;border-radius:2px;width:' + wPx + 'px;height:' + hPx + 'px';
       var fallbackSpan = document.createElement('span');
       fallbackSpan.innerHTML = '📷<span style="font-size:0.6em;display:block">' + escapeHtml(field.field) + '</span>';
       fallbackSpan.style.display = 'none';
@@ -1021,8 +1025,12 @@ function applyFieldBoxStyleAndText(el, field) {
         field.natW = natW;
         field.natH = natH;
         var scale = layoutStageScale();
-        el.style.width  = Math.round((field.widthPct  || 100) / 100 * natW * scale) + 'px';
-        el.style.height = Math.round((field.heightPct || 100) / 100 * natH * scale) + 'px';
+        var newW = Math.round((field.widthPct  || 100) / 100 * natW * scale);
+        var newH = Math.round((field.heightPct || 100) / 100 * natH * scale);
+        el.style.width  = newW + 'px';
+        el.style.height = newH + 'px';
+        previewImg.style.width  = newW + 'px';
+        previewImg.style.height = newH + 'px';
         if (state.selectedFieldIndex === state.layout.indexOf(field)) {
           var unit = ($('#propImgUnit') && $('#propImgUnit').value) || 'pct';
           var wInput = $('#propImgWidth'), hInput = $('#propImgHeight');
