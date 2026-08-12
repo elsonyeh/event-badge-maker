@@ -2809,7 +2809,7 @@ function previewPdfLayout() {
       '<table style="font-size:12.5px;border-collapse:collapse">' +
       '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">每頁名牌數</td><td><strong>' + slots.length + ' 個</strong></td></tr>' +
       '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">格子尺寸</td><td><strong>' + firstSlot.w.toFixed(1) + '&times;' + firstSlot.h.toFixed(1) + ' mm</strong></td></tr>' +
-      '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">名牌旋轉</td><td><strong>' + (rotate ? '是（旋轉 90° 以排更多）' : '否') + '</strong></td></tr>' +
+      '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">名牌旋轉</td><td><strong>' + (rotate ? '是' : '否') + '</strong></td></tr>' +
       '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">名單筆數</td><td><strong>' + rowsData.length + ' 筆' + (blankCount ? '＋' + blankCount + ' 空白' : '') + '</strong></td></tr>' +
       '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">預計頁數</td><td><strong>' + totalPages + ' 頁</strong></td></tr>' +
       '<tr><td style="color:var(--text-soft);padding:3px 10px 3px 0">紙張</td><td><strong>' + pageSize.w + '&times;' + pageSize.h + ' mm</strong></td></tr>' +
