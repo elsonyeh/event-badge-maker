@@ -998,6 +998,7 @@ function applyFieldBoxStyleAndText(el, field) {
     el.style.alignItems = 'center'; el.style.justifyContent = 'center';
     el.style.background = '';
     el.style.border = '';
+    el.style.padding = '0';
     el.style.color = 'var(--primary)'; el.style.fontWeight = '400';
     el.style.fontSize = Math.max(10, Math.min(wPx, hPx) * 0.3) + 'px';
     el.style.transform = 'translate(-50%,-50%)';
@@ -1058,7 +1059,7 @@ function applyFieldBoxStyleAndText(el, field) {
     el.style.textAlign = field.align || 'center';
     el.style.fontSize = Math.max(6, fit.fontSize * scale) + 'px';
     el.style.width = ''; el.style.height = ''; el.style.background = ''; el.style.border = '';
-    el.style.display = ''; el.style.flexDirection = '';
+    el.style.display = ''; el.style.flexDirection = ''; el.style.padding = '';
     el.innerHTML = fit.lines.map(escapeHtml).join('<br>');
     var anchorShift = field.align === 'left' ? '0%' : (field.align === 'right' ? '-100%' : '-50%');
     el.style.transform = 'translate(' + anchorShift + ', -50%)';
