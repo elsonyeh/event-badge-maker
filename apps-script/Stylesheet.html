@@ -119,7 +119,8 @@
 
   .canvas-wrap { flex: 1; min-width: 320px; display: flex; flex-direction: column; gap: 10px; position: sticky; top: 18px; align-self: flex-start; }
   .canvas-toolbar { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
-  .canvas-stage-center { display: flex; justify-content: center; }
+  .canvas-stage-center { display: flex; flex-direction: column; align-items: center; }
+  .canvas-caption { width: 100%; display: flex; justify-content: flex-end; padding: 0 2px 4px; }
   .editor-stage {
     position: relative; background: #ddd repeating-conic-gradient(#e8e8e8 0% 25%, #fff 0% 50%) 0 0/16px 16px;
     border: 1px solid var(--border); overflow: hidden; touch-action: none;

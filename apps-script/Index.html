@@ -145,11 +145,6 @@
             <div id="fieldTray"></div>
             <h4 style="margin-top:16px">已放置欄位</h4>
             <div id="placedList"></div>
-            <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
-              <label style="font-size:13px;display:flex;align-items:center;gap:6px;cursor:pointer;white-space:nowrap">
-                <input type="checkbox" id="snapToggle" checked style="width:auto;margin:0"> 🧲 格線吸附
-              </label>
-            </div>
           </div>
 
           <div class="canvas-wrap">
@@ -159,6 +154,11 @@
               <button class="primary" id="btnSaveLayout" disabled>💾 儲存版面設定</button>
             </div>
             <div class="canvas-stage-center">
+              <div class="canvas-caption">
+                <label style="font-size:12px;display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--text-soft);user-select:none">
+                  <input type="checkbox" id="snapToggle" checked style="width:auto;margin:0"> 🧲 格線吸附
+                </label>
+              </div>
               <div class="editor-stage" id="editorStage">
                 <img class="bg" id="editorBgImg" alt="">
                 <div class="guide-h" data-guide="33.33" style="top:33.33%"></div>
