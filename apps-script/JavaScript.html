@@ -1128,6 +1128,7 @@ function isPrimaryFieldName(name) {
 }
 
 // 自動排版：文字欄位置於上中段，圖片欄位置於下段，避免重疊。
+// 字體大小根據欄位數量與可用空間動態縮小；直/橫向名牌分別計算。
 function autoArrangeAllFields() {
   var SYSTEM = ['產生狀態', '產生時間', '圖片連結'];
   var allFields = (state.headers || []).filter(function (h) { return SYSTEM.indexOf(h) === -1; });
@@ -1135,6 +1136,7 @@ function autoArrangeAllFields() {
 
   var nativeW = state.bgNativeW || 1000;
   var nativeH = state.bgNativeH || 1000;
+  var isPortrait = nativeH >= nativeW;
 
   var existingMap = {};
   state.layout.forEach(function (f) { existingMap[f.field] = f; });
@@ -1142,25 +1144,36 @@ function autoArrangeAllFields() {
   var imageFields = allFields.filter(isImageField);
   var textFields  = allFields.filter(function (h) { return !isImageField(h); });
   var hasImages = imageFields.length > 0;
-  var hasText   = textFields.length > 0;
+  var nText = textFields.length;
+  var nImg  = imageFields.length;
 
-  // 字體基準：取寬高較小值避免橫向排版時字體過大
-  var fontRef = Math.min(nativeW, nativeH * 1.6);
-  var primaryFontSize = Math.round(fontRef * 0.10);
-  var normalFontSize  = Math.round(fontRef * 0.062);
-
-  // 找主要欄位（姓名）的索引
+  // 找主要欄位（姓名/name）索引
   var primaryIdx = 0;
   textFields.forEach(function (f, i) { if (isPrimaryFieldName(f)) primaryIdx = i; });
 
-  // 文字欄位的分佈範圍
-  var textTop = 28;
-  var textBot = hasImages ? 72 : 85;
-  var nText = textFields.length;
+  // 字體基準：取寬高最小值，避免橫向名牌字體過大
+  var fontRef = Math.min(nativeW, nativeH);
+
+  // 文字欄位 y 範圍：直向留更多底部空間給圖片
+  var textTop = 22;
+  var textBot = !hasImages ? 85 : (isPortrait ? 68 : 72);
+
+  // 根據欄位數動態計算字體上限
+  // 欄位間距（px）= availH / (nText-1)，字體不超過間距的 72%
+  var primaryFontSize, normalFontSize;
+  if (nText > 0) {
+    var availH  = (textBot - textTop) / 100 * nativeH;
+    var spacing  = nText > 1 ? availH / (nText - 1) : availH;
+    var maxByGap = nText > 1 ? Math.floor(spacing * 0.72) : Math.round(fontRef * 0.12);
+    primaryFontSize = Math.min(Math.round(fontRef * 0.11), maxByGap);
+    normalFontSize  = Math.min(Math.round(fontRef * 0.072), Math.round(maxByGap * 0.82));
+    primaryFontSize = Math.max(primaryFontSize, 12);
+    normalFontSize  = Math.max(normalFontSize,  12);
+  }
 
   var result = [];
 
-  // ---- 文字欄位（按 headers 順序） ----
+  // ---- 文字欄位（按 headers 順序排列） ----
   textFields.forEach(function (field, i) {
     var yPct = nText > 1
       ? textTop + (textBot - textTop) * i / (nText - 1)
@@ -1186,13 +1199,25 @@ function autoArrangeAllFields() {
     });
   });
 
-  // ---- 圖片欄位（置於下段，水平均分） ----
-  var nImg = imageFields.length;
+  // ---- 圖片欄位（置於下方；無文字時排成網格） ----
+  var imgY = nText > 0
+    ? (isPortrait ? 80 : 82)   // 有文字：直向留更多空間
+    : 50;                       // 純圖片：垂直置中
+
   imageFields.forEach(function (field, i) {
-    var xPct = nImg === 1 ? 50 : Math.round((20 + 60 * i / (nImg - 1)) * 10) / 10;
-    var yPct = hasText
-      ? 86
-      : (nImg > 1 ? Math.round((30 + 40 * i / (nImg - 1)) * 10) / 10 : 50);
+    var xPct, yPct;
+    if (nText === 0) {
+      // 純圖片模式：網格排列
+      var cols = nImg <= 2 ? nImg : Math.ceil(Math.sqrt(nImg));
+      var rows = Math.ceil(nImg / cols);
+      var col  = i % cols, row = Math.floor(i / cols);
+      xPct = cols > 1 ? Math.round((25 + 50 * col / (cols - 1)) * 10) / 10 : 50;
+      yPct = rows > 1 ? Math.round((30 + 40 * row / (rows - 1)) * 10) / 10 : 50;
+    } else {
+      // 有文字：圖片在底部水平分散
+      xPct = nImg === 1 ? 50 : Math.round((20 + 60 * i / (nImg - 1)) * 10) / 10;
+      yPct = imgY;
+    }
 
     if (existingMap[field]) {
       existingMap[field].xPct = xPct;
