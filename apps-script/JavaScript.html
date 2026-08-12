@@ -1754,38 +1754,41 @@ function batchDeleteChecked() {
     .catch(function (err) { toast(err.message, true); });
 }
 
-function renderListTable() {
-  var wrap = $('#listTableWrap');
-  var catRef = currentCategoryObj();
-  var displayHeaders = state.headers.filter(function (h) { return h !== '圖片連結'; });
-
-  // 分欄位篩選：只保留有值的欄位
+// 計算目前篩選後的可見列（純函式）
+function getVisibleRows(displayHeaders) {
   var filters = state.listFilters || {};
   var activeFilters = displayHeaders.filter(function (h) { return filters[h] && filters[h].trim(); });
-  var visibleRows = state.rows.filter(function (r) {
+  return state.rows.filter(function (r) {
     return activeFilters.every(function (h) {
       return String(r[h] || '').toLowerCase().indexOf(filters[h].trim().toLowerCase()) !== -1;
     });
   });
-  var hasFilter = activeFilters.length > 0;
+}
+
+// 只重建 tbody + 更新計數/全選狀態，不碰篩選框（避免打斷 IME 組字）
+function updateListTableBody(wrap, displayHeaders, catRef) {
+  var visibleRows = getVisibleRows(displayHeaders);
+  var filters = state.listFilters || {};
+  var hasFilter = displayHeaders.some(function (h) { return filters[h] && filters[h].trim(); });
   var countText = (hasFilter ? visibleRows.length + ' / ' : '') + state.rows.length + ' 筆';
 
+  var countEl = wrap.querySelector('th.filter-count');
+  if (countEl) countEl.textContent = countText;
+
   var allChecked = visibleRows.length > 0 && visibleRows.every(function (r) { return state.checkedRows.has(r._rowIndex); });
+  var checkAll = $('#checkAllRows');
+  if (checkAll) checkAll.checked = allChecked;
 
-  // 表頭第一列：全選 checkbox + 欄位名稱
-  var theadRow1 = '<tr><th><input type="checkbox" id="checkAllRows"' + (allChecked ? ' checked' : '') + '></th>' +
-    displayHeaders.map(function (h) { return '<th>' + escapeHtml(h) + '</th>'; }).join('') + '<th>操作</th></tr>';
+  var tbody = wrap.querySelector('tbody');
+  if (!tbody) return;
 
-  // 表頭第二列：分欄位篩選框
-  var theadRow2 = '<tr class="filter-row"><th></th>' +
-    displayHeaders.map(function (h) {
-      var val = escapeHtml(filters[h] || '');
-      return '<th><input type="text" class="col-filter" data-filter-col="' + escapeHtml(h) +
-        '" value="' + val + '" placeholder="🔍" style="width:100%;box-sizing:border-box;font-size:12px;padding:2px 4px"></th>';
-    }).join('') +
-    '<th class="hint" style="white-space:nowrap;font-size:12px;font-weight:normal">' + countText + '</th></tr>';
+  var emptyMsg = hasFilter ? '找不到符合篩選條件的名單。' : '目前還沒有名單，請在下方新增。';
+  if (visibleRows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="' + (displayHeaders.length + 2) + '" class="hint" style="padding:16px;">' + emptyMsg + '</td></tr>';
+    return;
+  }
 
-  var tbody = visibleRows.map(function (r) {
+  tbody.innerHTML = visibleRows.map(function (r) {
     var checked = state.checkedRows.has(r._rowIndex) ? ' checked' : '';
     var tds = '<td><input type="checkbox" class="row-check" data-row="' + r._rowIndex + '"' + checked + '></td>' +
       displayHeaders.map(function (h) {
@@ -1802,34 +1805,8 @@ function renderListTable() {
     return '<tr>' + tds + actions + '</tr>';
   }).join('');
 
-  var emptyMsg = hasFilter ? '找不到符合篩選條件的名單。' : '目前還沒有名單，請在下方新增。';
-  wrap.innerHTML = '<div class="table-scroll"><table><thead>' + theadRow1 + theadRow2 + '</thead><tbody>' +
-    (tbody || '<tr><td colspan="' + (displayHeaders.length + 2) + '" class="hint" style="padding:16px;">' + emptyMsg + '</td></tr>') +
-    '</tbody></table></div>';
-
-  // 全選
-  $('#checkAllRows').addEventListener('change', function () {
-    var checked = this.checked;
-    visibleRows.forEach(function (r) {
-      if (checked) state.checkedRows.add(r._rowIndex); else state.checkedRows.delete(r._rowIndex);
-    });
-    renderListTable();
-    updateCheckedCountUI();
-  });
-
-  // 篩選框：輸入後重繪並還原 focus
-  $all('.col-filter', wrap).forEach(function (inp) {
-    inp.addEventListener('input', function () {
-      var col = inp.dataset.filterCol;
-      state.listFilters[col] = inp.value;
-      renderListTable();
-      var refocus = wrap.querySelector('.col-filter[data-filter-col="' + col + '"]');
-      if (refocus) { refocus.focus(); refocus.setSelectionRange(refocus.value.length, refocus.value.length); }
-    });
-  });
-
-  // 列勾選：支援 Shift 快速範圍選取
-  $all('.row-check', wrap).forEach(function (cb) {
+  // 列層級事件
+  $all('.row-check', tbody).forEach(function (cb) {
     cb.addEventListener('click', function (e) {
       var idx = parseInt(cb.dataset.row, 10);
       if (e.shiftKey && state._lastCheckedRow !== null) {
@@ -1846,7 +1823,7 @@ function renderListTable() {
             else state.checkedRows.delete(visibleRows[k]._rowIndex);
           }
           state._lastCheckedRow = idx;
-          renderListTable();
+          updateListTableBody(wrap, displayHeaders, catRef);
           updateCheckedCountUI();
           return;
         }
@@ -1856,16 +1833,16 @@ function renderListTable() {
       updateCheckedCountUI();
     });
   });
-
-  $all('button[data-act="edit"]', wrap).forEach(function (btn) {
+  $all('button[data-act="edit"]', tbody).forEach(function (btn) {
     btn.addEventListener('click', function () { startEditRow(parseInt(btn.dataset.row, 10)); });
   });
-  $all('button[data-act="del"]', wrap).forEach(function (btn) {
+  $all('button[data-act="del"]', tbody).forEach(function (btn) {
     btn.addEventListener('click', function () {
       if (!confirm('確定要刪除這一列名單嗎？此動作無法復原。')) return;
       runAsync('deleteNameEntry', catRef.spreadsheetId, catRef.key, parseInt(btn.dataset.row, 10)).then(function (data) {
         state.checkedRows.delete(parseInt(btn.dataset.row, 10));
-        state.rows = data.rows; state.headers = data.headers; renderListTable();
+        state.rows = data.rows; state.headers = data.headers;
+        renderListTable();
         updateCheckedCountUI();
         if (state.editingRowIndex === parseInt(btn.dataset.row, 10)) resetAddEntryFormMode();
         loadGenerateTab(state.currentCategory);
@@ -1873,14 +1850,67 @@ function renderListTable() {
       }).catch(function (err) { toast(err.message, true); });
     });
   });
-  $all('button[data-act="reset"]', wrap).forEach(function (btn) {
+  $all('button[data-act="reset"]', tbody).forEach(function (btn) {
     btn.addEventListener('click', function () {
       runAsync('resetGenerationStatus', catRef.spreadsheetId, catRef.key, parseInt(btn.dataset.row, 10)).then(function (data) {
-        state.rows = data.rows; state.headers = data.headers; renderListTable(); loadGenerateTab(state.currentCategory);
+        state.rows = data.rows; state.headers = data.headers;
+        renderListTable();
+        loadGenerateTab(state.currentCategory);
         toast('已重設為未產生，可重新輸出');
       }).catch(function (err) { toast(err.message, true); });
     });
   });
+}
+
+function renderListTable() {
+  var wrap = $('#listTableWrap');
+  var catRef = currentCategoryObj();
+  var displayHeaders = state.headers.filter(function (h) { return h !== '圖片連結'; });
+  var filters = state.listFilters || {};
+
+  // 表頭第一列：全選 + 欄位名稱
+  var theadRow1 = '<tr><th><input type="checkbox" id="checkAllRows"></th>' +
+    displayHeaders.map(function (h) { return '<th>' + escapeHtml(h) + '</th>'; }).join('') + '<th>操作</th></tr>';
+
+  // 表頭第二列：分欄位篩選框（建好後不再重建，只更新 tbody）
+  var theadRow2 = '<tr class="filter-row"><th></th>' +
+    displayHeaders.map(function (h) {
+      var val = escapeHtml(filters[h] || '');
+      return '<th><input type="text" class="col-filter" data-filter-col="' + escapeHtml(h) +
+        '" value="' + val + '" placeholder="🔍" style="width:100%;box-sizing:border-box;font-size:12px;padding:2px 4px"></th>';
+    }).join('') +
+    '<th class="hint filter-count" style="white-space:nowrap;font-size:12px;font-weight:normal"></th></tr>';
+
+  wrap.innerHTML = '<div class="table-scroll"><table><thead>' + theadRow1 + theadRow2 + '</thead><tbody></tbody></table></div>';
+
+  // 全選
+  $('#checkAllRows').addEventListener('change', function () {
+    var visibleRows = getVisibleRows(displayHeaders);
+    var checked = this.checked;
+    visibleRows.forEach(function (r) {
+      if (checked) state.checkedRows.add(r._rowIndex); else state.checkedRows.delete(r._rowIndex);
+    });
+    updateListTableBody(wrap, displayHeaders, catRef);
+    updateCheckedCountUI();
+  });
+
+  // 篩選框：compositionstart/end 防止 IME 組字被打斷
+  $all('.col-filter', wrap).forEach(function (inp) {
+    var col = inp.dataset.filterCol;
+    inp.addEventListener('compositionstart', function () { inp._composing = true; });
+    inp.addEventListener('compositionend', function () {
+      inp._composing = false;
+      state.listFilters[col] = inp.value;
+      updateListTableBody(wrap, displayHeaders, catRef);
+    });
+    inp.addEventListener('input', function () {
+      if (inp._composing) return;
+      state.listFilters[col] = inp.value;
+      updateListTableBody(wrap, displayHeaders, catRef);
+    });
+  });
+
+  updateListTableBody(wrap, displayHeaders, catRef);
 }
 
 function renderAddEntryForm() {
