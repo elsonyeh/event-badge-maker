@@ -1127,45 +1127,88 @@ function isPrimaryFieldName(name) {
   return s === '姓名' || s === 'name' || s.indexOf('姓名') !== -1 || s.indexOf('name') !== -1;
 }
 
-// 依標題列順序將所有欄位平均排入畫布中段（30%~75% 高度）。
-// 已放置的欄位保留其字型、顏色等設定，只重置 x/y 位置；未放置的新欄位使用預設值。
+// 自動排版：文字欄位置於上中段，圖片欄位置於下段，避免重疊。
 function autoArrangeAllFields() {
-  var allFields = (state.headers || []).filter(function (h) {
-    return h !== '產生狀態' && h !== '產生時間' && h !== '圖片連結';
-  });
+  var SYSTEM = ['產生狀態', '產生時間', '圖片連結'];
+  var allFields = (state.headers || []).filter(function (h) { return SYSTEM.indexOf(h) === -1; });
   if (!allFields.length) return 0;
 
-  var n = allFields.length;
-  var bandTop = 30, bandBottom = 75;
   var nativeW = state.bgNativeW || 1000;
+  var nativeH = state.bgNativeH || 1000;
 
   var existingMap = {};
   state.layout.forEach(function (f) { existingMap[f.field] = f; });
 
-  state.layout = allFields.map(function (field, idx) {
-    var yPct = n > 1 ? bandTop + ((bandBottom - bandTop) * idx) / (n - 1) : 50;
+  var imageFields = allFields.filter(isImageField);
+  var textFields  = allFields.filter(function (h) { return !isImageField(h); });
+  var hasImages = imageFields.length > 0;
+  var hasText   = textFields.length > 0;
+
+  // 字體基準：取寬高較小值避免橫向排版時字體過大
+  var fontRef = Math.min(nativeW, nativeH * 1.6);
+  var primaryFontSize = Math.round(fontRef * 0.10);
+  var normalFontSize  = Math.round(fontRef * 0.062);
+
+  // 找主要欄位（姓名）的索引
+  var primaryIdx = 0;
+  textFields.forEach(function (f, i) { if (isPrimaryFieldName(f)) primaryIdx = i; });
+
+  // 文字欄位的分佈範圍
+  var textTop = 28;
+  var textBot = hasImages ? 72 : 85;
+  var nText = textFields.length;
+
+  var result = [];
+
+  // ---- 文字欄位（按 headers 順序） ----
+  textFields.forEach(function (field, i) {
+    var yPct = nText > 1
+      ? textTop + (textBot - textTop) * i / (nText - 1)
+      : (textTop + textBot) / 2;
     yPct = Math.round(yPct * 10) / 10;
+
     if (existingMap[field]) {
       existingMap[field].xPct = 50;
       existingMap[field].yPct = yPct;
-      return existingMap[field];
+      result.push(existingMap[field]);
+      return;
     }
-    if (isImageField(field)) {
-      return { field: field, type: 'image', xPct: 50, yPct: yPct, widthPct: 100, heightPct: 100, _lockRatio: true };
-    }
-    var primary = isPrimaryFieldName(field);
-    return {
-      field: field,
-      xPct: 50,
-      yPct: yPct,
-      fontSize: Math.round(nativeW * (primary ? 0.12 : 0.06)),
+
+    var isPrimary = (i === primaryIdx);
+    result.push({
+      field: field, xPct: 50, yPct: yPct,
+      fontSize: isPrimary ? primaryFontSize : normalFontSize,
       fontFamily: FONT_CHOICES[0].value,
       color: '#000000',
-      bold: primary,
+      bold: isPrimary,
       align: 'center',
       maxWidthPct: 80
-    };
+    });
   });
+
+  // ---- 圖片欄位（置於下段，水平均分） ----
+  var nImg = imageFields.length;
+  imageFields.forEach(function (field, i) {
+    var xPct = nImg === 1 ? 50 : Math.round((20 + 60 * i / (nImg - 1)) * 10) / 10;
+    var yPct = hasText
+      ? 86
+      : (nImg > 1 ? Math.round((30 + 40 * i / (nImg - 1)) * 10) / 10 : 50);
+
+    if (existingMap[field]) {
+      existingMap[field].xPct = xPct;
+      existingMap[field].yPct = yPct;
+      result.push(existingMap[field]);
+      return;
+    }
+
+    result.push({
+      field: field, type: 'image',
+      xPct: xPct, yPct: yPct,
+      widthPct: 100, heightPct: 100, _lockRatio: true
+    });
+  });
+
+  state.layout = result;
   state.dirtyLayout = true;
   updateSaveButtonState();
   pushLayoutHistory();
