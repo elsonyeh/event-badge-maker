@@ -1760,7 +1760,13 @@ function getVisibleRows(displayHeaders) {
   var activeFilters = displayHeaders.filter(function (h) { return filters[h] && filters[h].trim(); });
   return state.rows.filter(function (r) {
     return activeFilters.every(function (h) {
-      return String(r[h] || '').toLowerCase().indexOf(filters[h].trim().toLowerCase()) !== -1;
+      var fv = filters[h].trim();
+      if (h === '產生狀態') {
+        if (fv === '已產生') return !!r[h];
+        if (fv === '未產生') return !r[h];
+        return true;
+      }
+      return String(r[h] || '').toLowerCase().indexOf(fv.toLowerCase()) !== -1;
     });
   });
 }
@@ -1875,9 +1881,16 @@ function renderListTable() {
   // 表頭第二列：分欄位篩選框（建好後不再重建，只更新 tbody）
   var theadRow2 = '<tr class="filter-row"><th></th>' +
     displayHeaders.map(function (h) {
-      var val = escapeHtml(filters[h] || '');
+      var val = filters[h] || '';
+      if (h === '產生狀態') {
+        return '<th><select class="col-filter" data-filter-col="產生狀態" style="width:100%;font-size:12px;padding:1px 2px;box-sizing:border-box">' +
+          '<option value="">全部</option>' +
+          '<option value="已產生"' + (val === '已產生' ? ' selected' : '') + '>已產生</option>' +
+          '<option value="未產生"' + (val === '未產生' ? ' selected' : '') + '>未產生</option>' +
+          '</select></th>';
+      }
       return '<th><input type="text" class="col-filter" data-filter-col="' + escapeHtml(h) +
-        '" value="' + val + '" placeholder="🔍" style="width:100%;box-sizing:border-box;font-size:12px;padding:2px 4px"></th>';
+        '" value="' + escapeHtml(val) + '" placeholder="🔍" style="width:100%;box-sizing:border-box;font-size:12px;padding:2px 4px"></th>';
     }).join('') +
     '<th class="hint filter-count" style="white-space:nowrap;font-size:12px;font-weight:normal"></th></tr>';
 
@@ -1894,20 +1907,27 @@ function renderListTable() {
     updateCheckedCountUI();
   });
 
-  // 篩選框：compositionstart/end 防止 IME 組字被打斷
-  $all('.col-filter', wrap).forEach(function (inp) {
-    var col = inp.dataset.filterCol;
-    inp.addEventListener('compositionstart', function () { inp._composing = true; });
-    inp.addEventListener('compositionend', function () {
-      inp._composing = false;
-      state.listFilters[col] = inp.value;
-      updateListTableBody(wrap, displayHeaders, catRef);
-    });
-    inp.addEventListener('input', function () {
-      if (inp._composing) return;
-      state.listFilters[col] = inp.value;
-      updateListTableBody(wrap, displayHeaders, catRef);
-    });
+  // 篩選框：select 用 change；text input 用 compositionstart/end + e.isComposing 防止 IME 中斷
+  $all('.col-filter', wrap).forEach(function (el) {
+    var col = el.dataset.filterCol;
+    if (el.tagName === 'SELECT') {
+      el.addEventListener('change', function () {
+        state.listFilters[col] = el.value;
+        updateListTableBody(wrap, displayHeaders, catRef);
+      });
+    } else {
+      el.addEventListener('compositionstart', function () { el._composing = true; });
+      el.addEventListener('compositionend', function () {
+        el._composing = false;
+        state.listFilters[col] = el.value;
+        updateListTableBody(wrap, displayHeaders, catRef);
+      });
+      el.addEventListener('input', function (e) {
+        if (el._composing || (e && e.isComposing)) return;
+        state.listFilters[col] = el.value;
+        updateListTableBody(wrap, displayHeaders, catRef);
+      });
+    }
   });
 
   updateListTableBody(wrap, displayHeaders, catRef);

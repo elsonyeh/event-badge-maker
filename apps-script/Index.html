@@ -154,21 +154,23 @@
               <button class="primary" id="btnSaveLayout" disabled>💾 儲存版面設定</button>
             </div>
             <div class="canvas-stage-center">
-              <div class="canvas-caption">
-                <label style="font-size:12px;display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--text-soft);user-select:none">
-                  <input type="checkbox" id="snapToggle" checked style="width:auto;margin:0"> 🧲 格線吸附
-                </label>
-              </div>
-              <div class="editor-stage" id="editorStage">
-                <img class="bg" id="editorBgImg" alt="">
-                <div class="guide-h" data-guide="33.33" style="top:33.33%"></div>
-                <div class="guide-h" data-guide="50"    style="top:50%"></div>
-                <div class="guide-h" data-guide="66.67" style="top:66.67%"></div>
-                <div class="guide-v" data-guide="33.33" style="left:33.33%"></div>
-                <div class="guide-v" data-guide="50"    style="left:50%"></div>
-                <div class="guide-v" data-guide="66.67" style="left:66.67%"></div>
-                <div id="stageLoadingOverlay" style="display:none;position:absolute;inset:0;background:rgba(255,255,255,0.8);z-index:20;align-items:center;justify-content:center">
-                  <div class="spinner"></div>
+              <div class="canvas-stage-col">
+                <div class="editor-stage" id="editorStage">
+                  <img class="bg" id="editorBgImg" alt="">
+                  <div class="guide-h" data-guide="33.33" style="top:33.33%"></div>
+                  <div class="guide-h" data-guide="50"    style="top:50%"></div>
+                  <div class="guide-h" data-guide="66.67" style="top:66.67%"></div>
+                  <div class="guide-v" data-guide="33.33" style="left:33.33%"></div>
+                  <div class="guide-v" data-guide="50"    style="left:50%"></div>
+                  <div class="guide-v" data-guide="66.67" style="left:66.67%"></div>
+                  <div id="stageLoadingOverlay" style="display:none;position:absolute;inset:0;background:rgba(255,255,255,0.8);z-index:20;align-items:center;justify-content:center">
+                    <div class="spinner"></div>
+                  </div>
+                </div>
+                <div class="canvas-caption">
+                  <label style="font-size:12px;display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--text-soft);user-select:none">
+                    <input type="checkbox" id="snapToggle" checked style="width:auto;margin:0"> 🧲 格線吸附
+                  </label>
                 </div>
               </div>
             </div>
