@@ -82,7 +82,10 @@
 
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   table th, table td { border-bottom: 1px solid var(--border); padding: 7px 8px; text-align: left; white-space: nowrap; }
-  table th { color: var(--text-soft); font-weight: 600; background: #fafbfc; position: sticky; top: 0; }
+  table th { color: var(--text-soft); font-weight: 600; background: #fafbfc; position: sticky; top: 0; z-index: 1; }
+  .filter-row th { position: static; background: #f0f2f5; padding: 3px 6px; border-bottom: 2px solid var(--border); }
+  .filter-row th input { border: 1px solid var(--border); border-radius: 3px; background: #fff; color: var(--text); }
+  .filter-row th input:focus { outline: none; border-color: var(--accent); }
   .table-scroll { max-height: 460px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
 
   .pill { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 11.5px; font-weight: 600; }

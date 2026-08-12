@@ -264,15 +264,14 @@
 
       <div id="listBody" style="display:none">
         <div class="card">
-          <div class="row" style="justify-content:space-between">
+          <div class="row" style="justify-content:space-between;align-items:center">
             <h3 style="margin:0">目前名單</h3>
-            <span class="hint checked-count-label">未勾選（預設處理全部名單）</span>
+            <div class="row" style="gap:8px;align-items:center">
+              <button id="btnBatchDelete" class="small danger" style="display:none">🗑 批次刪除</button>
+              <span class="hint checked-count-label">未勾選（預設處理全部名單）</span>
+            </div>
           </div>
-          <div class="row" style="margin-top:8px;margin-bottom:4px">
-            <input type="text" id="listSearch" placeholder="🔍 搜尋名單…" style="flex:1;min-width:180px">
-            <span id="listSearchCount" class="hint" style="white-space:nowrap"></span>
-          </div>
-          <p class="hint">勾選左邊的核取方塊可以只針對「這幾筆」產生名牌，不勾則預設處理全部名單。</p>
+          <p class="hint" style="margin-top:6px">勾選左邊的核取方塊可以只針對「這幾筆」產生名牌，不勾則預設處理全部名單。可按住 Shift 快速選取範圍。</p>
           <div id="listTableWrap"></div>
         </div>
 

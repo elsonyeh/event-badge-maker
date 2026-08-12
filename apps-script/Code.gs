@@ -626,6 +626,15 @@ function deleteNameEntry(spreadsheetId, category, rowIndex) {
   return getNameList(spreadsheetId, category);
 }
 
+// 批次刪除：由大到小排序後逐列刪，避免刪前面的列導致 index 位移
+function deleteNameEntries(spreadsheetId, category, rowIndexes) {
+  var ss = openSpreadsheet_(spreadsheetId);
+  var sheet = getCategorySheet_(ss, category);
+  rowIndexes.sort(function (a, b) { return b - a; });
+  rowIndexes.forEach(function (rowIndex) { sheet.deleteRow(rowIndex); });
+  return getNameList(spreadsheetId, category);
+}
+
 function resetGenerationStatus(spreadsheetId, category, rowIndex) {
   var ss = openSpreadsheet_(spreadsheetId);
   var sheet = getCategorySheet_(ss, category);

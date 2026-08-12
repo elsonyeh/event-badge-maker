@@ -30,7 +30,8 @@ var state = {
   previewImages: {},       // { fieldName: 'data:...' } 版面編輯器圖片欄位的縮圖（第一列）
   lastGenerated: [],       // [{filename, dataUrl, rowIndex}] 本次瀏覽器工作階段中已產生的名牌，供打包下載
   exportScope: 'all',      // 'all' | 'pending' | 'checked' — 輸出範圍（PNG 與 PDF 共用）
-  listSearch: '',           // 名單搜尋關鍵字
+  listFilters: {},          // 名單分欄位篩選 { headerName: keyword, ... }
+  _lastCheckedRow: null,    // Shift 快速勾選：記住上一個點擊的 _rowIndex
   cancelGeneration: false  // PNG 渲染迴圈的取消旗標
 };
 
@@ -465,10 +466,7 @@ function wireStaticEvents() {
 
   // ---- 名單管理 ----
   $('#listCategorySelect').addEventListener('change', function (e) { selectCategory(e.target.value); });
-  $('#listSearch').addEventListener('input', function () {
-    state.listSearch = this.value.trim().toLowerCase();
-    renderListTable();
-  });
+  $('#btnBatchDelete').addEventListener('click', batchDeleteChecked);
   $('#btnAddEntry').addEventListener('click', submitSingleEntry);
   $('#btnCancelEdit').addEventListener('click', resetAddEntryFormMode);
   $('#btnParseBulk').addEventListener('click', parseBulkPaste);
@@ -1726,6 +1724,8 @@ function updateCheckedCountUI() {
   });
   var scopeChecked = $('#scopeBtnChecked');
   if (scopeChecked) scopeChecked.disabled = n === 0;
+  var batchDel = $('#btnBatchDelete');
+  if (batchDel) batchDel.style.display = n > 0 ? '' : 'none';
   // 若勾選清空，且當前範圍是「勾選的」，自動回退到「全部」
   if (n === 0 && state.exportScope === 'checked') {
     state.exportScope = 'all';
@@ -1733,21 +1733,58 @@ function updateCheckedCountUI() {
   }
 }
 
+function batchDeleteChecked() {
+  var n = state.checkedRows.size;
+  if (n === 0) return;
+  if (!confirm('確定要刪除已勾選的 ' + n + ' 筆名單嗎？此動作無法復原。')) return;
+  var catRef = currentCategoryObj();
+  var ids = [];
+  state.checkedRows.forEach(function (v) { ids.push(v); });
+  runAsync('deleteNameEntries', catRef.spreadsheetId, catRef.key, ids)
+    .then(function (data) {
+      state.checkedRows = new Set();
+      state._lastCheckedRow = null;
+      state.rows = data.rows;
+      state.headers = data.headers;
+      renderListTable();
+      updateCheckedCountUI();
+      loadGenerateTab(state.currentCategory);
+      toast('已刪除 ' + n + ' 筆名單');
+    })
+    .catch(function (err) { toast(err.message, true); });
+}
+
 function renderListTable() {
   var wrap = $('#listTableWrap');
   var catRef = currentCategoryObj();
   var displayHeaders = state.headers.filter(function (h) { return h !== '圖片連結'; });
-  var q = state.listSearch || '';
-  var visibleRows = q ? state.rows.filter(function (r) {
-    return displayHeaders.some(function (h) {
-      return String(r[h] || '').toLowerCase().indexOf(q) !== -1;
+
+  // 分欄位篩選：只保留有值的欄位
+  var filters = state.listFilters || {};
+  var activeFilters = displayHeaders.filter(function (h) { return filters[h] && filters[h].trim(); });
+  var visibleRows = state.rows.filter(function (r) {
+    return activeFilters.every(function (h) {
+      return String(r[h] || '').toLowerCase().indexOf(filters[h].trim().toLowerCase()) !== -1;
     });
-  }) : state.rows;
-  var countEl = $('#listSearchCount');
-  if (countEl) countEl.textContent = q ? ('共 ' + visibleRows.length + ' / ' + state.rows.length + ' 筆') : '';
+  });
+  var hasFilter = activeFilters.length > 0;
+  var countText = (hasFilter ? visibleRows.length + ' / ' : '') + state.rows.length + ' 筆';
+
   var allChecked = visibleRows.length > 0 && visibleRows.every(function (r) { return state.checkedRows.has(r._rowIndex); });
-  var thead = '<tr><th><input type="checkbox" id="checkAllRows"' + (allChecked ? ' checked' : '') + '></th>' +
+
+  // 表頭第一列：全選 checkbox + 欄位名稱
+  var theadRow1 = '<tr><th><input type="checkbox" id="checkAllRows"' + (allChecked ? ' checked' : '') + '></th>' +
     displayHeaders.map(function (h) { return '<th>' + escapeHtml(h) + '</th>'; }).join('') + '<th>操作</th></tr>';
+
+  // 表頭第二列：分欄位篩選框
+  var theadRow2 = '<tr class="filter-row"><th></th>' +
+    displayHeaders.map(function (h) {
+      var val = escapeHtml(filters[h] || '');
+      return '<th><input type="text" class="col-filter" data-filter-col="' + escapeHtml(h) +
+        '" value="' + val + '" placeholder="🔍" style="width:100%;box-sizing:border-box;font-size:12px;padding:2px 4px"></th>';
+    }).join('') +
+    '<th class="hint" style="white-space:nowrap;font-size:12px;font-weight:normal">' + countText + '</th></tr>';
+
   var tbody = visibleRows.map(function (r) {
     var checked = state.checkedRows.has(r._rowIndex) ? ' checked' : '';
     var tds = '<td><input type="checkbox" class="row-check" data-row="' + r._rowIndex + '"' + checked + '></td>' +
@@ -1764,26 +1801,62 @@ function renderListTable() {
       '</td>';
     return '<tr>' + tds + actions + '</tr>';
   }).join('');
-  var emptyMsg = q ? '找不到符合「' + escapeHtml(q) + '」的名單。' : '目前還沒有名單，請在下方新增。';
-  wrap.innerHTML = '<div class="table-scroll"><table><thead>' + thead + '</thead><tbody>' +
+
+  var emptyMsg = hasFilter ? '找不到符合篩選條件的名單。' : '目前還沒有名單，請在下方新增。';
+  wrap.innerHTML = '<div class="table-scroll"><table><thead>' + theadRow1 + theadRow2 + '</thead><tbody>' +
     (tbody || '<tr><td colspan="' + (displayHeaders.length + 2) + '" class="hint" style="padding:16px;">' + emptyMsg + '</td></tr>') +
     '</tbody></table></div>';
 
+  // 全選
   $('#checkAllRows').addEventListener('change', function () {
-    var checked = $('#checkAllRows').checked;
+    var checked = this.checked;
     visibleRows.forEach(function (r) {
       if (checked) state.checkedRows.add(r._rowIndex); else state.checkedRows.delete(r._rowIndex);
     });
     renderListTable();
     updateCheckedCountUI();
   });
+
+  // 篩選框：輸入後重繪並還原 focus
+  $all('.col-filter', wrap).forEach(function (inp) {
+    inp.addEventListener('input', function () {
+      var col = inp.dataset.filterCol;
+      state.listFilters[col] = inp.value;
+      renderListTable();
+      var refocus = wrap.querySelector('.col-filter[data-filter-col="' + col + '"]');
+      if (refocus) { refocus.focus(); refocus.setSelectionRange(refocus.value.length, refocus.value.length); }
+    });
+  });
+
+  // 列勾選：支援 Shift 快速範圍選取
   $all('.row-check', wrap).forEach(function (cb) {
-    cb.addEventListener('change', function () {
+    cb.addEventListener('click', function (e) {
       var idx = parseInt(cb.dataset.row, 10);
+      if (e.shiftKey && state._lastCheckedRow !== null) {
+        var lastPos = -1, currPos = -1;
+        for (var j = 0; j < visibleRows.length; j++) {
+          if (visibleRows[j]._rowIndex === state._lastCheckedRow) lastPos = j;
+          if (visibleRows[j]._rowIndex === idx) currPos = j;
+        }
+        if (lastPos !== -1 && currPos !== -1) {
+          var lo = Math.min(lastPos, currPos), hi = Math.max(lastPos, currPos);
+          var shouldCheck = cb.checked;
+          for (var k = lo; k <= hi; k++) {
+            if (shouldCheck) state.checkedRows.add(visibleRows[k]._rowIndex);
+            else state.checkedRows.delete(visibleRows[k]._rowIndex);
+          }
+          state._lastCheckedRow = idx;
+          renderListTable();
+          updateCheckedCountUI();
+          return;
+        }
+      }
       if (cb.checked) state.checkedRows.add(idx); else state.checkedRows.delete(idx);
+      state._lastCheckedRow = idx;
       updateCheckedCountUI();
     });
   });
+
   $all('button[data-act="edit"]', wrap).forEach(function (btn) {
     btn.addEventListener('click', function () { startEditRow(parseInt(btn.dataset.row, 10)); });
   });
