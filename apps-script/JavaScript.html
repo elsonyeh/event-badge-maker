@@ -1345,6 +1345,7 @@ function renderPropsPanel() {
   $('#propFieldType').value = isImage ? 'image' : 'text';
   $('#propTextControls').style.display = isImage ? 'none' : 'block';
   $('#propImageControls').style.display = isImage ? 'block' : 'none';
+  $('#propImgUnitWrap').style.display   = isImage ? 'block' : 'none';
   if (isImage) {
     var unit = ($('#propImgUnit') && $('#propImgUnit').value) || 'pct';
     var unitLabel = unit === 'px' ? 'px' : unit === 'cm' ? 'cm' : '%';
@@ -1829,49 +1830,85 @@ function parseBulkPaste() {
   var raw = $('#bulkPasteArea').value;
   if (!raw.trim()) { toast('請先貼上資料', true); return; }
   var lines = raw.replace(/\r/g, '').split('\n').filter(function (l) { return l.trim() !== ''; });
+  if (!lines.length) { toast('沒有有效資料', true); return; }
   var delim = lines[0].indexOf('\t') !== -1 ? '\t' : ',';
   var editableHeaders = state.headers.filter(function (h) { return ['產生狀態', '產生時間', '圖片連結'].indexOf(h) === -1; });
 
   var firstCells = lines[0].split(delim).map(function (s) { return s.trim(); });
-  var headerMatches = firstCells.length > 1 && firstCells.every(function (c) { return editableHeaders.indexOf(c) !== -1; });
-  var dataLines = headerMatches ? lines.slice(1) : lines;
-  var useHeaders = headerMatches ? firstCells : editableHeaders;
+  // 第一列的所有非空格子都能對到系統欄位 → 判定為標題列
+  var nonEmpty = firstCells.filter(function (c) { return c; });
+  var looksLikeHeader = nonEmpty.length > 0 && nonEmpty.every(function (c) { return editableHeaders.indexOf(c) !== -1; });
 
-  var parsed = dataLines.map(function (line) {
-    var cells = line.split(delim);
-    var obj = {};
-    useHeaders.forEach(function (h, i) { obj[h] = (cells[i] || '').trim(); });
-    return obj;
-  }).filter(function (o) { return Object.keys(o).some(function (k) { return o[k]; }); });
+  state._pendingBulkRaw = { lines: lines, delim: delim, firstCells: firstCells };
 
-  state._pendingBulk = parsed;
-  var preview = $('#bulkPreview');
-  if (!parsed.length) {
-    preview.innerHTML = '<div class="hint">沒有解析到有效資料，請確認格式（可直接從 Excel 複製多列多欄後貼上）。</div>';
-    $('#btnConfirmBulk').style.display = 'none';
-    return;
-  }
-  var cols = useHeaders;
-  var rowsHtml = parsed.slice(0, 20).map(function (o) {
-    return '<tr>' + cols.map(function (c) { return '<td>' + escapeHtml(o[c]) + '</td>'; }).join('') + '</tr>';
+  var totalRows = looksLikeHeader ? lines.length - 1 : lines.length;
+  var mappingRows = firstCells.map(function (cell, i) {
+    var label = looksLikeHeader ? escapeHtml(cell) : ('欄 ' + (i + 1) + (cell ? '（' + escapeHtml(cell) + '）' : ''));
+    var autoMatch = editableHeaders.indexOf(cell) !== -1 ? cell : '';
+    var options = '<option value="">（略過）</option>' +
+      editableHeaders.map(function (h) {
+        return '<option value="' + escapeHtml(h) + '"' + (h === autoMatch ? ' selected' : '') + '>' + escapeHtml(h) + '</option>';
+      }).join('');
+    return '<tr>' +
+      '<td style="padding:4px 10px 4px 0;font-size:13px">' + label + '</td>' +
+      '<td><select data-bulk-col="' + i + '" style="width:100%">' + options + '</select></td>' +
+      '</tr>';
   }).join('');
-  preview.innerHTML = '<div class="hint">預覽（共 ' + parsed.length + ' 筆' + (parsed.length > 20 ? '，僅顯示前 20 筆' : '') + '）：</div>' +
-    '<div class="table-scroll" style="max-height:220px"><table><thead><tr>' +
-    cols.map(function (c) { return '<th>' + escapeHtml(c) + '</th>'; }).join('') + '</tr></thead><tbody>' + rowsHtml + '</tbody></table></div>';
+
+  var mappingDiv = $('#bulkMapping');
+  mappingDiv.style.display = 'block';
+  mappingDiv.innerHTML =
+    '<div style="margin-bottom:8px">' +
+      '<label><input type="checkbox" id="bulkFirstRowIsHeader"' + (looksLikeHeader ? ' checked' : '') + '> 第一列是欄位名稱（不匯入為資料）</label>' +
+    '</div>' +
+    '<p style="font-size:13px;color:var(--text-soft);margin-bottom:6px">選擇貼上的每個欄位對應的系統欄位：</p>' +
+    '<table style="width:100%;border-collapse:collapse">' +
+    '<thead><tr>' +
+    '<th style="text-align:left;padding:4px 10px 4px 0;color:var(--text-soft);font-weight:600;border-bottom:1px solid var(--border)">貼上的欄位</th>' +
+    '<th style="text-align:left;padding:4px 0;color:var(--text-soft);font-weight:600;border-bottom:1px solid var(--border)">對應系統欄位</th>' +
+    '</tr></thead>' +
+    '<tbody>' + mappingRows + '</tbody>' +
+    '</table>' +
+    '<p class="hint" style="margin-top:8px">共 ' + totalRows + ' 筆資料（不含標題列）</p>';
+
   $('#btnConfirmBulk').style.display = 'inline-block';
+  $('#bulkPreview').innerHTML = '';
 }
 
 function confirmBulkImport() {
-  var parsed = state._pendingBulk || [];
-  if (!parsed.length) return;
+  var raw = state._pendingBulkRaw;
+  if (!raw) { toast('請先解析資料', true); return; }
   var catRef = currentCategoryObj();
   if (!catRef) return;
-  // 重複偵測：比對待匯入資料與現有名單
-  var systemFields = new Set(['產生狀態', '產生時間', '圖片連結', '_rowIndex']);
-  var dataFields = state.headers.filter(function (h) { return !systemFields.has(h); });
+
+  var isHeader = !!($('#bulkFirstRowIsHeader') && $('#bulkFirstRowIsHeader').checked);
+  var dataLines = isHeader ? raw.lines.slice(1) : raw.lines;
+
+  // 從對應 UI 收集欄位對應
+  var colMap = {};
+  $all('select[data-bulk-col]', $('#bulkMapping')).forEach(function (sel) {
+    var fieldName = sel.value;
+    if (fieldName) colMap[parseInt(sel.dataset.bulkCol, 10)] = fieldName;
+  });
+
+  var parsed = dataLines.map(function (line) {
+    var cells = line.split(raw.delim);
+    var obj = {};
+    Object.keys(colMap).forEach(function (i) {
+      obj[colMap[i]] = (cells[parseInt(i, 10)] || '').trim();
+    });
+    return obj;
+  }).filter(function (o) { return Object.keys(o).some(function (k) { return o[k]; }); });
+
+  if (!parsed.length) { toast('沒有有效資料可匯入（請確認欄位對應）', true); return; }
+
+  // 重複偵測
+  var systemFields = ['產生狀態', '產生時間', '圖片連結', '_rowIndex'];
+  var dataFields = state.headers.filter(function (h) { return systemFields.indexOf(h) === -1; });
   var rowKey = function (r) { return dataFields.map(function (h) { return String(r[h] || '').trim(); }).join('\x00'); };
-  var existingKeys = new Set(state.rows.map(rowKey));
-  var dupNames = parsed.filter(function (r) { return existingKeys.has(rowKey(r)); })
+  var existingKeys = {};
+  state.rows.forEach(function (r) { existingKeys[rowKey(r)] = true; });
+  var dupNames = parsed.filter(function (r) { return existingKeys[rowKey(r)]; })
     .map(function (r) { return r[dataFields[0]] || '（空白）'; });
   if (dupNames.length) {
     var msg = '偵測到 ' + dupNames.length + ' 筆資料與現有名單重複：\n' +
@@ -1879,14 +1916,16 @@ function confirmBulkImport() {
       '\n\n要繼續匯入（含重複）嗎？';
     if (!confirm(msg)) return;
   }
+
   busy($('#btnConfirmBulk'), true);
   runAsync('addNameEntriesBulk', catRef.spreadsheetId, catRef.key, parsed).then(function (data) {
     state.rows = data.rows; state.headers = data.headers;
     renderListTable();
     $('#bulkPasteArea').value = '';
     $('#bulkPreview').innerHTML = '';
+    $('#bulkMapping').style.display = 'none';
     $('#btnConfirmBulk').style.display = 'none';
-    state._pendingBulk = null;
+    state._pendingBulkRaw = null;
     loadGenerateTab(state.currentCategory);
     toast('已匯入 ' + parsed.length + ' 筆名單');
   }).catch(function (err) { toast(err.message, true); }).finally(function () { busy($('#btnConfirmBulk'), false); });
